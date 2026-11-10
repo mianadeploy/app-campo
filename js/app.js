@@ -1,8 +1,10 @@
 // App de Campo · Miana Consulting – código genérico; nomes de projeto/cliente vêm do pacote de dados
 import * as DB from './db.js';
 import { makeZip, readZip } from './zip.js';
+import { qrSvg } from './qr.js';
 
-export const APP_VERSION = '1.4.0';
+export const APP_VERSION = '1.5.0';
+const ACEITA_PACOTE = '.zip,.json,application/zip,application/x-zip-compressed,application/json,application/octet-stream';
 const ETAPAS = ['Conferido', 'Preparado', 'Desceu', 'Na doca', 'Embarcado'];
 const PROX = ['1 Conferir', '2 Preparar', '3 Descer', '4 Levar à doca', '5 Embarcar', '6 Embarcado'];
 // motivos e rótulos de escopo: do pacote de dados (seed.escopo); aqui só o padrão genérico
@@ -11,7 +13,7 @@ const ESCOPO_PADRAO = { motivos_fora: ['Lote anterior (já retirado)', 'Duplicad
 const ESC = () => ({ ...ESCOPO_PADRAO, ...((S.seed && S.seed.escopo) || {}) });
 const S = { seed: null, itens: [], byId: new Map(), estado: new Map(), meta: {}, planta: 'L0', view: 'planta',
             zoom: { s: 1, x: 0, y: 0 }, painel: null, plantaUrls: {}, salasEd: [], edit: false, draw: null,
-            filtro: null, abertos: {}, det: false, detIt: new Set(), eqSel: null, fq: {}, alias: {}, aliasInv: {} };
+            filtro: null, abertos: {}, det: false, detIt: new Set(), eqSel: null, fq: {}, alias: {}, aliasInv: {}, fotosSala: new Map(), thumbUrl: new Map(), ultPac: null };
 const $ = (sel, el = document) => el.querySelector(sel);
 const h = (tag, attrs = {}, ...kids) => {
   const e = document.createElement(tag);
@@ -75,23 +77,35 @@ for (const ev of ['pointerdown', 'keydown']) document.addEventListener(ev, garan
 // até abrir outra, ficar mais de 2 min na planta sem painel, ou fechar o dia. A janela de vistoria da sala vai da 1ª à última
 // ação feita nela (conferir, etapa, foto, nota, item novo); só olhar não abre janela. Tudo vai em vistorias.json (casar fotos).
 const DOIS_MIN = 120e3;
-const codSala = s => !s ? '' : s.tipo === 'sala' || !s.tipo ? (s.codigo && s.codigo !== '?' ? s.codigo : s.id) : (s.id === '__SL__' ? s.codigo : (s.nome || s.codigo || s.id));
+const codSala = s => !s ? '' : s.tipo === 'sala' || s.tipo === 'externa' || !s.tipo ? (s.codigo && s.codigo !== '?' ? s.codigo : s.id) : (s.id === '__SL__' ? s.codigo : (s.nome || s.codigo || s.id));
+// modo inspeção (ciclo 8): chave no topo, lembrada no aparelho. Ligado, abrir o painel de uma sala já inicia a janela da sala
+// (tipo "inspecao") e mostra a tela de abertura para o fotógrafo; desligado, vale a regra do ciclo 7 (só ação conta).
+function inspLigada(v) {
+  if (v === undefined) { if (S.insp === undefined) { try { S.insp = localStorage.getItem('appcampo.insp') === '1'; } catch { S.insp = false; } } return S.insp; }
+  S.insp = !!v; try { localStorage.setItem('appcampo.insp', v ? '1' : '0'); } catch { /* sem armazenamento: vale só nesta sessão */ }
+}
+async function proxSeq(chave) { const n = ((await DB.get('meta', chave)) || 0) + 1; await DB.put('meta', n, chave); return n; }
 const idAtual = () => (S.meta.vistoria && S.meta.vistoria.abriu ? S.meta.vistoria.sala : null);
 async function entrouSala(s) {
-  const v = S.meta.vistoria, agora = Date.now();
-  if (v && v.sala === s.id) { if (v.fora) { v.fora = null; await DB.put('meta', v, 'vistoria'); } return; }
+  const v = S.meta.vistoria, agora = Date.now(), insp = inspLigada();
+  if (v && v.sala === s.id && !!v.insp === insp) { if (v.fora) { v.fora = null; await DB.put('meta', v, 'vistoria'); } return; }
   if (v) await encerrarVistoria(agora);
-  S.meta.vistoria = { sala: s.id, rot: codSala(s), abriu: agora, ini: null, ult: null, n: 0, fora: null };
+  S.meta.vistoria = { sala: s.id, rot: codSala(s), abriu: agora, ini: insp ? agora : null, ult: null, n: 0, fora: null };
+  if (insp) Object.assign(S.meta.vistoria, { insp: 1, seq: await proxSeq('inspSeq'), telas: [] });
   await DB.put('meta', S.meta.vistoria, 'vistoria');
+  if (insp && S.painel && S.painel.id === s.id) telaAbertura(s);  // só aqui: a janela acabou de abrir. Com a janela já aberta, só "Mostrar de novo"
   S.meta.recentes = [s.id, ...(S.meta.recentes || []).filter(x => x !== s.id)].slice(0, 8); await DB.put('meta', S.meta.recentes, 'recentes');
   renderStatus();
 }
 async function encerrarVistoria(saiu = Date.now()) {
   const v = S.meta.vistoria; if (!v) return;
   S.meta.vistoria = null; await DB.put('meta', null, 'vistoria');
-  const t = v.ult || saiu;  // com ações: evento "fim" no horário da última ação (janela = ini → fim); sem ações: só a visita
+  // com ações: evento "fim" no horário da última ação (janela = ini → fim); sem ações: só a visita.
+  // Inspeção: a janela vai da abertura do painel até a saída da sala, com ou sem ação.
+  const t = v.insp ? saiu : (v.ult || saiu);
   await DB.put('eventos', { ts: t, tipo: 'vistoria', id: v.sala, campo: v.ini ? 'fim' : 'visita', valor: new Date(t).toISOString(), sala: v.sala, rot: v.rot,
-    ini: v.ini, fim: v.ult, abriu: v.abriu, saiu, n: v.n, auto: 1, exportado: 0 });
+    ini: v.ini, fim: v.insp ? saiu : v.ult, abriu: v.abriu, saiu, n: v.n, auto: 1, exportado: 0,
+    ...(v.insp ? { modo: 'inspecao', ordem: v.seq, telas: v.telas || [] } : {}) });  // "seq" é a chave do registro de eventos: não usar
   renderStatus();
 }
 function acaoNaSala(ts) {
@@ -99,9 +113,73 @@ function acaoNaSala(ts) {
   v.ini = v.ini || ts; v.ult = ts; v.n = (v.n || 0) + 1; return DB.put('meta', v, 'vistoria');
 }
 // a cada 15 s: atualiza o indicador e encerra a sala atual depois de 2 min na planta sem painel aberto
+async function alternarInspecao() {
+  inspLigada(!inspLigada());
+  await encerrarVistoria();  // a janela aberta fecha com a regra com que foi aberta; a sala em tela reabre com a regra nova
+  renderTopo(); if (S.painel) { await entrouSala(S.painel); renderPainel(); }
+  toast(inspLigada() ? 'Modo inspeção ligado: abrir a sala já inicia a janela e mostra a tela para o fotógrafo' : 'Modo inspeção desligado');
+}
+function renderTopo() {
+  const on = inspLigada(), b = $('#btnInsp'); document.body.classList.toggle('insp', on);
+  if (b) { b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); b.textContent = on ? '🔎 Inspeção: ligada' : 'Inspeção'; b.onclick = () => { if (S.seed) alternarInspecao(); }; }
+  const m = $('#btnMenu'); if (m) m.onclick = () => { if (S.seed) abrirMenu(); };
+}
+function abrirMenu() {
+  const s = S.painel, v = S.meta.vistoria;
+  modal(h('div', { class: 'ficha', id: 'menu' }, h('h2', {}, 'Menu'),
+    h('div', { class: 'menu-ops' },
+      h('button', { id: 'mnCalibrar', onclick: () => { fecharModal(); setTimeout(telaCalibrar, 150); } }, '🕒 Calibrar relógio (fotógrafo)'),
+      h('button', { id: 'mnInsp', onclick: () => { fecharModal(); alternarInspecao(); } }, inspLigada() ? '🔎 Desligar o modo inspeção' : '🔎 Ligar o modo inspeção'),
+      s && v && v.insp && v.sala === s.id ? h('button', { id: 'mnAbertura', onclick: () => { fecharModal(); setTimeout(() => telaAbertura(s), 150); } }, `📺 Tela de abertura de ${codSala(s)}`) : null),
+    h('p', { class: 'sub' }, 'Calibrar relógio: o fotógrafo fotografa essa tela no início do dia; a foto dá o desvio do relógio da câmera.'),
+    h('div', { class: 'acts' }, h('button', { type: 'button', onclick: fecharModal }, 'Fechar'))));
+}
+// ---------- tela de abertura da sala e calibração do relógio (ciclo 8) ----------
+// O relógio da câmera do fotógrafo quase nunca bate com o do celular. Ao entrar numa sala (modo inspeção), o app mostra em tela
+// cheia o código da sala, a hora com segundos e um QR "sala|data-hora ISO|nº"; o fotógrafo fotografa a tela e, no escritório,
+// essa foto abre a sala para as fotos seguintes dele. O QR só leva o identificador da sala, a hora e o nº (nada de projeto).
+const p2 = n => String(n).padStart(2, '0');
+export const isoLocal = ts => { const d = new Date(ts), o = -d.getTimezoneOffset(), a = Math.abs(o);
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}${o >= 0 ? '+' : '-'}${p2(Math.floor(a / 60))}:${p2(a % 60)}`; };
+const horaSeg = ts => { const d = new Date(ts); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; };
+function telaCheia(conteudo, aoTique) {
+  if ($('#abertura')) desempilhar('abertura');
+  const el = h('div', { id: 'abertura', role: 'dialog', onclick: () => { if (!desempilhar('abertura')) fim(); } }, conteudo);
+  const iv = setInterval(() => aoTique(el), 250);
+  const fim = () => { clearInterval(iv); el.remove(); };
+  document.body.append(el); aoTique(el); empilhar('abertura', fim);
+}
+async function telaAbertura(s) {
+  const v = S.meta.vistoria; if (!v || v.sala !== s.id || !v.insp) return;
+  const ts = Date.now(), cod = codSala(s), txt = `${s.id}|${isoLocal(ts)}|${v.seq}`;
+  v.telas = [...(v.telas || []), ts]; await DB.put('meta', v, 'vistoria');
+  telaCheia(h('div', { class: 'ab-box', 'data-qr': txt },
+    h('div', { class: 'ab-rot' }, 'SALA'),
+    h('div', { class: 'ab-cod', id: 'abCod', style: `font-size:min(${Math.round(130 / Math.max(6, cod.length))}vw,17vh)` }, cod),
+    h('div', { class: 'ab-nome' }, s.nome && s.nome !== cod ? s.nome : ''),
+    h('div', { class: 'ab-data' }, new Date(ts).toLocaleDateString('pt-BR'), h('b', { id: 'abHora' }, horaSeg(ts))),
+    h('div', { class: 'ab-qr', id: 'abQr', html: qrSvg(txt) }),
+    h('div', { class: 'ab-pe' }, `nº ${v.seq} · fotografe esta tela ao entrar na sala · toque para fechar`)),
+    el => { const hr = el.querySelector('#abHora'); if (hr) hr.textContent = horaSeg(Date.now()); });
+}
+async function telaCalibrar() {
+  const n = await proxSeq('calSeq'); let ult = '';
+  await log('sistema', null, 'calibração do relógio', isoLocal(Date.now()));
+  telaCheia(h('div', { class: 'ab-box cal' },
+    h('div', { class: 'ab-rot' }, 'CALIBRAR RELÓGIO'),
+    h('div', { class: 'ab-cod', id: 'abHora' }, ''),
+    h('div', { class: 'ab-data', id: 'abDia' }, ''),
+    h('div', { class: 'ab-qr', id: 'abQr' }),
+    h('div', { class: 'ab-pe' }, 'fotografe esta tela com a câmera, no início do dia · toque para fechar')),
+    el => {  // o QR acompanha o relógio, segundo a segundo: a foto dá o desvio do relógio da câmera
+      const agora = Date.now(), iso = isoLocal(agora); if (iso === ult) return; ult = iso;
+      el.querySelector('#abHora').textContent = horaSeg(agora); el.querySelector('#abDia').textContent = new Date(agora).toLocaleDateString('pt-BR');
+      const q = el.querySelector('#abQr'); q.innerHTML = qrSvg(`CAL|${iso}|${n}`); q.dataset.qr = `CAL|${iso}|${n}`;
+    });
+}
 async function tique() {
   const v = S.meta.vistoria; if (!v || !v.abriu) return;
-  const naPlanta = S.view === 'planta' && !S.painel && !S.eqSel && !$('#modal').classList.contains('on');
+  const naPlanta = S.view === 'planta' && !S.painel && !S.eqSel && !$('#modal').classList.contains('on') && !$('#abertura') && !$('#camera');
   if (!naPlanta) { if (v.fora) { v.fora = null; await DB.put('meta', v, 'vistoria'); } }
   else if (!v.fora) { v.fora = Date.now(); await DB.put('meta', v, 'vistoria'); }
   else if (Date.now() - v.fora > DOIS_MIN) await encerrarVistoria(v.fora);
@@ -174,7 +252,7 @@ async function carregar() {
   // nome da sala no Schedule (ex.: DOCA) ↔ sala da planta: "Onde está agora" pode guardar um ou outro
   S.alias = {}; S.aliasInv = {};
   for (const i of seed.itens) if (i.local && i.sala && i.sala !== i.local) { S.alias[i.sala] = i.local; S.aliasInv[i.local] = i.sala; }
-  await migrarDivergencias(); await migrarVistoriaManual();
+  await migrarDivergencias(); await migrarVistoriaManual(); await indexarFotosSala();
   for (const nv of Object.keys(seed.plantas)) {
     const blob = await DB.get('arquivos', 'planta_' + nv);
     if (S.plantaUrls[nv]) URL.revokeObjectURL(S.plantaUrls[nv]);
@@ -188,6 +266,18 @@ async function carregar() {
   }
   return true;
 }
+// ciclo 8: cada foto de sala é um registro (sala, hora, origem, comentário, equipamento, ponto na planta). As fotos de
+// "Notas / inspeção" de versões anteriores viram registros, sem perder nada. O índice em memória guarda só os metadados.
+async function indexarFotosSala() {
+  S.fotosSala = new Map();
+  for (const f of await DB.all('fotos')) {
+    if (!String(f.item || '').startsWith('SALA:')) continue;
+    if (!f.reg) { Object.assign(f, { sala_id: f.item.slice(5), origem: 'app', com: f.com || '', equip: f.equip || '', ponto: f.ponto || null, reg: 1, migrado: 'Notas / inspeção' }); await DB.put('fotos', f); }
+    const { blob, ...m } = f; if (!S.fotosSala.has(f.sala_id)) S.fotosSala.set(f.sala_id, []); S.fotosSala.get(f.sala_id).push(m);
+  }
+  for (const l of S.fotosSala.values()) l.sort((a, b) => a.ts - b.ts);
+}
+const fotosDaSala = s => S.fotosSala.get(s.id) || [];
 // ciclo 6b: "não está no site / não encontrado" deixou de ser "fora do escopo" e passou a ser divergência
 async function migrarDivergencias() {
   const md = new Set(ESC().motivos_diverg.concat(['Não está no site', 'Não encontrado']));
@@ -237,6 +327,7 @@ function renderStatus() {
             h('span', { class: 'pill hide-sm' + (velho && p ? ' bad' : '') }, u ? `Último fechamento ${fmtD(u)}` : 'Nunca fechado'),
             idAtual() ? h('span', { class: 'pill vist', id: 'pillSala', title: 'Sala em que o app considera que você está' },
               `📷 ${S.meta.vistoria.rot || S.meta.vistoria.sala} · ${Math.max(0, Math.round((Date.now() - S.meta.vistoria.abriu) / 60e3))} min`) : null].filter(Boolean));
+  renderTopo();
   const fx = $('#faixaDemo'); if (fx) fx.hidden = !(S.seed && S.seed.demo); document.body.classList.toggle('demo', !!(S.seed && S.seed.demo));
 }
 // Lista, Resumo e Equipamentos são uma camada sobre a planta: o voltar retorna à planta, com o zoom de antes
@@ -292,7 +383,8 @@ function salaSob(m) {
   if (!m || m.tipo !== 'marca' || !m.poly || !m.poly.length) return null;
   const c = [m.poly.reduce((a, p) => a + p[0], 0) / m.poly.length, m.poly.reduce((a, p) => a + p[1], 0) / m.poly.length];
   const base = salasDe(m.planta || S.planta).concat(((S.seed.plantas[m.planta] || {}).salas || []).filter(x => x.dentro));
-  return base.find(x => x.tipo === 'sala' && x.poly && pip(c, x.poly)) || base.find(x => x.tipo === 'area' && x.poly && pip(c, x.poly)) || null;
+  return base.find(x => x.tipo === 'sala' && x.poly && pip(c, x.poly)) || base.find(x => x.tipo === 'area' && x.poly && pip(c, x.poly))
+    || base.find(x => x.tipo === 'externa' && x.poly && pip(c, x.poly)) || null;
 }
 function nomeOficial(o) { return [o.codigo && o.codigo !== '?' && o.codigo !== o.nome ? o.codigo : '', o.nome].filter(Boolean).join(' '); }
 function rotuloSala(s) {
@@ -336,7 +428,8 @@ function telaPlanta() {
   const NS = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(NS, 'svg');
   svg.setAttribute('viewBox', `0 0 ${pl.w} ${pl.h}`); svg.setAttribute('width', pl.w); svg.setAttribute('height', pl.h); svg.classList.add('salas');
-  const ordem = { bloco: 0, area: 0, sala: 1, marca: 2 };
+  const ordem = { externa: -1, bloco: 0, area: 0, sala: 1, marca: 2 };  // áreas externas (ciclo 8) por baixo de tudo
+  svg.innerHTML = '<defs><pattern id="hachuraExt" width="26" height="26" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="26" stroke="#00796b" stroke-width="5" stroke-opacity=".28"/></pattern></defs>';
   for (const s of [...salas].sort((a, b) => ordem[a.tipo] - ordem[b.tipo])) {
     const its = ativos(itensDaSala(s)); const cf = conferidos(its);
     const pr = S.modoCor === 'mov' ? progresso(its) : (its.length ? cf / its.length : 0);
@@ -350,7 +443,7 @@ function telaPlanta() {
     const ly = s.label ? s.label[1] : s.poly.reduce((a, p) => a + p[1], 0) / s.poly.length;
     if (its.length || s.tipo !== 'sala') {
       layer.append(h('span', { class: 'dot dot-' + s.tipo, style: `left:${lx}px;top:${ly}px;--c:${cor(pr)}`, 'data-dot': s.id }));
-      const tit = s.tipo === 'sala' ? (s.codigo !== '?' ? s.codigo : s.id) : s.tipo === 'bloco' ? `${s.codigo} ▸` : s.nome;
+      const tit = s.tipo === 'sala' ? (s.codigo !== '?' ? s.codigo : s.id) : s.tipo === 'bloco' ? `${s.codigo} ▸` : s.tipo === 'externa' ? s.codigo : s.nome;
       layer.append(h('button', { class: `pin pin-${s.tipo}`, style: `left:${lx}px;top:${ly}px;--c:${s.tipo === 'marca' ? (COR_MARCA[s.marca] || '#555') : cor(pr)}`,
         'data-pin': s.tipo === 'sala' && s.codigo !== '?' ? s.codigo : s.id, 'data-sala': s.id, onclick: ev => { ev.stopPropagation(); tocarSala(s); } },
         h('b', {}, tit), its.length ? h('small', {}, `${cf}/${its.length}`) : null));
@@ -514,7 +607,7 @@ function tocarPonto(x, y) {
     if (S.edTmp.pts.length === 2) dividir(S.edTmp.sala, S.edTmp.pts[0], S.edTmp.pts[1]); else render();
     return;
   }
-  const pri = { marca: 0, sala: 1, bloco: 2, area: 2 };
+  const pri = { marca: 0, sala: 1, bloco: 2, area: 2, externa: 3 };
   const cand = salasDe(S.planta).filter(s => noPoligono(x, y, s.poly))
     .sort((a, b) => pri[a.tipo] - pri[b.tipo] || area2(a.poly) - area2(b.poly));
   if (cand.length) tocarSala(cand[0]);
@@ -797,7 +890,7 @@ function formSala(s, titulo, onSalvar, comExcluir) {
           if (c && nm && !nm.value) nm.value = c.n || ''; } })),
       h('label', {}, 'Nome', h('input', { name: 'nome', value: s.nome || '' })),
       s.tipo === 'sala' || !s.tipo ? h('label', { class: 'chk full' }, h('input', { type: 'checkbox', name: 'revisada', id: 'chkRevisada', checked: !!s.revisada }), ' Sala revisada (conferi contorno, código e nome)') : null,
-      h('label', {}, 'Tipo', h('select', { name: 'tipo' }, [['sala', 'Sala'], ['area', 'Área (agrupa salas/subáreas)'], ['marca', 'Subárea / marcação']].map(([v, t]) => h('option', { value: v, selected: v === (s.tipo || 'sala') }, t)))),
+      h('label', {}, 'Tipo', h('select', { name: 'tipo' }, [['sala', 'Sala'], ['area', 'Área (agrupa salas/subáreas)'], ['marca', 'Subárea / marcação'], ['externa', 'Área externa']].map(([v, t]) => h('option', { value: v, selected: v === (s.tipo || 'sala') }, t)))),
       h('label', {}, 'Marcação (se subárea)', h('select', { name: 'marca' }, h('option', { value: '' }, '—'), Object.keys(COR_MARCA).map(k => h('option', { value: k, selected: k === s.marca }, k)))),
       h('label', { class: 'full' }, 'Nota', h('textarea', { name: 'nota', rows: 2 }, s.nota || ''))),
     h('div', { class: 'acts' },
@@ -821,7 +914,7 @@ function abrirSala(s, q) {
   if (!S.filtro || S.filtro.sala !== s.id) { S.filtro = { sala: s.id, q: q || '', pref: '' }; S.abertos = {}; }  // o filtro vale enquanto estiver na sala
   else if (q != null) { S.filtro.q = q; S.filtro.pref = ''; }
   S.painel = s; if (novo) empilhar('painel', fecharPainelJa);
-  entrouSala(s); renderPainel();
+  entrouSala(s).then(() => { if (S.painel === s) renderPainel(); }); renderPainel();
   if (S.view === 'planta') { const pg = document.querySelector(`polygon[data-sala="${CSS.escape(s.id)}"]`); document.querySelectorAll('polygon.sel').forEach(p => p.classList.remove('sel')); if (pg) pg.classList.add('sel'); }
 }
 function fecharPainelJa() { S.painel = null; $('#painel').classList.remove('on'); if (S.view === 'planta') render(); }
@@ -871,16 +964,19 @@ function renderPainel() {
   const todosSala = itensDaSala(s); const todos = filtraSala(todosSala);
   const its = ativos(todos); const foraL = todos.filter(foraEsc); const divL = todos.filter(it => divEsc(it) && !foraEsc(it));
   const nota = est('SALA:' + s.id); const f = S.filtro || (S.filtro = { sala: s.id, q: '', pref: '' });
+  const insp = inspLigada(); const lemb = lembretes(s);
   const prefs = [...new Set(todosSala.map(i => prefixo(i.tag)))].sort();
   const filtrando = !!(f.pref || (f.q || '').trim());
   const head = h('div', { class: 'phead' },
     h('div', {}, h('button', { class: 'voltar', id: 'btnVoltarPainel', onclick: fecharPainel }, '← Voltar'), h('h2', {}, rotuloSala(s) || s.id),
-      h('div', { class: 'sub' }, `${{ sala: 'Sala', area: 'Área', marca: 'Subárea / marcação' }[s.tipo] || ''}${s.area_m2 ? ' · ' + Math.round(s.area_m2) + ' m²' : ''} · ${its.length} itens · ${conferidos(its)} conferidos`,
+      h('div', { class: 'sub' }, `${{ sala: 'Sala', area: 'Área', marca: 'Subárea / marcação', externa: 'Área externa' }[s.tipo] || ''}${s.area_m2 ? ' · ' + Math.round(s.area_m2) + ' m²' : ''} · ${its.length} itens · ${conferidos(its)} conferidos`,
         s.duvida ? h('div', { class: 'nota duvida', id: 'avisoDuvida' }, '⚠ ' + s.duvida) : null,
-        s.nota ? h('div', { class: 'nota' }, '📌 ' + s.nota) : null, nota.com ? h('div', { class: 'nota' }, '📝 ' + nota.com) : null)),
+        s.nota ? h('div', { class: 'nota' }, '📌 ' + s.nota) : null, nota.com ? h('div', { class: 'nota' }, '📝 ' + nota.com) : null,
+        lemb.length ? h('div', { class: 'nota lembrete', id: 'lembreteSala' }, `⚡ Nesta sala: ${lemb.map(l => l.rot).join(' · ')} – fotografar`) : null)),
     h('div', { class: 'pact' },
+      insp ? h('button', { id: 'btnAbertura', title: 'Mostrar de novo a tela de abertura para o fotógrafo', onclick: async () => { await entrouSala(s); telaAbertura(s); } }, '📺 Mostrar de novo') : null,
       h('button', { id: 'btnDetalhes', class: S.det ? 'on' : '', 'aria-pressed': String(!!S.det), title: 'Mostrar peso e dimensões de todos os itens', onclick: () => { S.det = !S.det; S.detIt.clear(); renderPainel(); } }, S.det ? 'Detalhes: ligados' : 'Detalhes'),
-      h('button', { id: 'btnNotasSala', onclick: () => notasSala(s) }, `📝 Notas / inspeção${nota.fotos.length ? ' (' + nota.fotos.length + '📷)' : ''}`),
+      h('button', { id: 'btnNotasSala', onclick: () => notasSala(s) }, '📝 Notas / inspeção'),
       h('button', { id: 'btnNovoItem', onclick: () => novoItem(s) }, '+ Item não previsto'),
       h('button', { class: 'x', onclick: fecharPainel, 'aria-label': 'Fechar' }, '✕')));
   // filtro da sala (ciclo 7): texto (tag, equipamento, CF-ID, volume) + botões rápidos com os prefixos das tags presentes
@@ -891,10 +987,12 @@ function renderPainel() {
       onclick: () => { f.pref = f.pref === pf ? '' : pf; renderPainel(); } }, pf))) : null,
     filtrando ? h('div', { class: 'sub', id: 'nFiltro' }, `${todos.length} de ${todosSala.length} itens `, h('button', { class: 'mini', id: 'btnLimparFiltro', onclick: () => { f.q = ''; f.pref = ''; renderPainel(); } }, '✕ limpar filtro')) : null) : null;
   const body = h('div', { class: 'pbody' });
+  if (insp) body.append(secFotos(s));  // modo inspeção: as fotos da sala vêm antes da lista de equipamentos
   const grupos = grupoPorEquip(its);
   for (const [tag, lst] of grupos) body.append(blocoEquip(tag, lst, grupos.length <= 3, s));
   if (!its.length && filtrando) body.append(h('p', { class: 'vazio' }, 'Nenhum item desta sala passa no filtro.'));
-  else if (!its.length) body.append(h('p', { class: 'vazio' }, foraL.length || divL.length ? 'Todos os itens daqui estão fora do escopo ou em divergência.' : 'Nenhum item previsto aqui. Use "+ Item não previsto" para registrar o que encontrar, e "Notas / inspeção" para observações e fotos da sala.'));
+  else if (!its.length) body.append(h('p', { class: 'vazio' }, foraL.length || divL.length ? 'Todos os itens daqui estão fora do escopo ou em divergência.' : 'Nenhum item previsto aqui. Use "+ Item não previsto" para registrar o que encontrar, "Fotos da sala" para fotografar e "Notas / inspeção" para observações.'));
+  if (!insp) body.append(secFotos(s));  // fora do modo inspeção, as fotos da sala ficam depois dos equipamentos (só aqui; "Notas" tem só o texto)
   if (foraL.length) { // à parte, recolhido: não conta na planta, mas dá para rever e desfazer
     const det = h('details', { class: 'eq fora-grupo', id: 'grupoFora' }, h('summary', {}, h('b', {}, `⊘ ${ESC().rotulo_fora} (${foraL.length})`),
       h('span', { class: 'nm' }, ' não contam na planta nem nas pendências')));
@@ -907,7 +1005,7 @@ function renderPainel() {
     for (const it of divL) det.append(linhaItem(it));
     body.append(det);
   }
-  p.append(head, barra, body); p.classList.add('on'); body.scrollTop = rol;
+  p.append(...[head, barra, body].filter(Boolean)); p.classList.add('on'); body.scrollTop = rol;
   if (foco) { inp.focus(); try { inp.setSelectionRange(inp.value.length, inp.value.length); } catch { /* campo de busca sem seleção */ } }
 }
 // marca/desmarca "fora do escopo" num conjunto de itens (ficha ou lote por equipamento) – reversível
@@ -966,23 +1064,130 @@ function loteFora(tag, lst) {
 }
 async function notasSala(s) {
   const id = 'SALA:' + s.id; const e = est(id);
-  const fotosBox = h('div', { class: 'thumbs' });
-  for (const fid of e.fotos) { const f = await DB.get('fotos', fid); if (f) fotosBox.append(thumb(f)); }
-  const pseudo = { id, tag: 'SALA', sala: s.codigo !== '?' ? s.codigo : s.id };
   const form = h('form', { class: 'ficha', onsubmit: async ev => {
     ev.preventDefault(); const fd = new FormData(form);
     await setEstado(id, { com: fd.get('com') || '', estado: fd.get('estado') || '' }, 'notas sala', fd.get('com') || '');
     fecharModal(); toast('Notas salvas');
   } },
     h('h2', {}, `Notas / inspeção – ${rotuloSala(s)}`),
-    h('p', { class: 'sub' }, 'Observações gerais e fotos da sala (base para a inspeção predial: piso, paredes, forro, portas, iluminação, infiltração, elétrica).'),
+    h('p', { class: 'sub' }, 'Observações gerais da sala (piso, paredes, forro, portas, iluminação, infiltração, elétrica). As fotos ficam em "Fotos da sala", no painel.'),
     h('div', { class: 'grid' },
       h('label', {}, 'Condição geral', h('select', { name: 'estado' }, h('option', { value: '' }, '—'), ['Boa', 'Regular', 'Ruim', 'Interditada'].map(o => h('option', { value: o, selected: o === e.estado }, o)))),
       h('label', { class: 'full' }, 'Observações', h('textarea', { name: 'com', rows: 4 }, e.com || ''))),
-    h('div', { class: 'fotos' }, h('b', {}, 'Fotos da sala'), fotosBox,
-      h('label', { class: 'btn' }, '📷 Tirar / escolher foto', h('input', { type: 'file', accept: 'image/*', capture: 'environment', multiple: true, hidden: true, name: 'foto',
-        onchange: async ev => { for (const f of ev.target.files) { const fo = await addFoto(f, pseudo); fotosBox.append(thumb(fo)); } ev.target.value = ''; } }))),
     h('div', { class: 'acts' }, h('button', { type: 'button', onclick: fecharModal }, 'Cancelar'), h('button', { type: 'submit', class: 'primary' }, 'Salvar')));
+  modal(form);
+}
+
+// ---------- fotos da sala (ciclo 8): registro com comentário, equipamento e ponto na planta ----------
+const lembretes = s => { const L = (S.seed && S.seed.lembretes) || {}; return [...(L[s.id] || []), ...(s.codigo && s.codigo !== s.id ? (L[s.codigo] || []) : [])]; };
+function urlFoto(id) {  // miniatura: a imagem é lida do aparelho uma vez e reaproveitada
+  if (!S.thumbUrl.has(id)) S.thumbUrl.set(id, DB.get('fotos', id).then(f => (f && f.blob ? URL.createObjectURL(f.blob) : '')));
+  return S.thumbUrl.get(id);
+}
+function thumbReg(m, s) {
+  const img = h('img', { alt: m.nome }); urlFoto(m.id).then(u => { if (u) img.src = u; });
+  const marcas = [m.com ? '💬' : '', m.equip ? '🔧' : '', m.ponto ? '📍' : ''].join('');
+  return h('figure', { class: 'reg', 'data-foto': m.id, title: 'Tocar para comentar, ligar a um equipamento ou marcar o ponto', onclick: () => editarFoto(m.id, s) },
+    img, h('figcaption', {}, `${m.id} ${marcas}`), m.com ? h('div', { class: 'reg-com' }, m.com) : null, m.equip ? h('div', { class: 'reg-eq' }, m.equip) : null);
+}
+// seção "Fotos da sala": câmera contínua (foto → foto → foto, sem sair da tela) e, como alternativa, a câmera/galeria do aparelho
+function secFotos(s) {
+  const l = fotosDaSala(s);
+  const aoEscolher = async ev => { const fs = [...ev.target.files]; ev.target.value = ''; for (const f of fs) await addFotoSala(f, s); renderPainel(); };
+  return h('section', { class: 'fotos-sala', id: 'fotosSala' },
+    h('div', { class: 'fs-head' }, h('b', { id: 'nFotosSala' }, `📷 Fotos da sala (${l.length})`),
+      h('button', { type: 'button', class: 'primary', id: 'btnFotografar', onclick: () => abrirCamera(s) }, '📷 Fotografar'),
+      h('label', { class: 'btn mini' }, '🖼 Do aparelho', h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, name: 'foto', id: 'inFotoSala', onchange: aoEscolher })),
+      h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true, id: 'inFotoCap', onchange: aoEscolher })),
+    l.length ? null : h('p', { class: 'sub' }, 'Sem fotos ainda. "Fotografar" abre a câmera e tira várias fotos seguidas; o comentário pode ficar para depois.'),
+    h('div', { class: 'thumbs', id: 'thumbsSala' }, l.map(m => thumbReg(m, s))),
+    l.length ? h('p', { class: 'sub' }, 'Toque numa foto para comentar, ligar a um equipamento ou marcar o ponto na planta.') : null);
+}
+async function addFotoSala(file, s) {
+  return addFoto(file, { id: 'SALA:' + s.id, tag: 'SALA' }, s.codigo && s.codigo !== '?' ? s.codigo : s.id,
+    { sala_id: s.id, planta: s.planta || S.planta, origem: 'app', com: '', equip: '', ponto: null, reg: 1 });
+}
+// câmera dentro do app: cada toque no disparador grava uma foto e a câmera continua aberta
+async function abrirCamera(s) {
+  let stream = null;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 4096 }, height: { ideal: 3072 } } }); }
+  catch { const i = $('#inFotoCap'); if (i) { toast('Câmera do app indisponível – abrindo a câmera do aparelho'); i.click(); } return; }
+  const video = h('video', { autoplay: true, playsinline: true, muted: true }); video.srcObject = stream; video.muted = true;
+  const cnt = h('b', { id: 'camN' }, '0 fotos'), ult = h('img', { id: 'camUlt', alt: '' }); let n = 0, fila = Promise.resolve();
+  const disparar = () => {
+    el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 120);
+    fila = fila.then(async () => {
+      let blob = null; const tr = stream.getVideoTracks()[0];
+      try { if (window.ImageCapture && !window.__TEST__) blob = await new ImageCapture(tr).takePhoto(); } catch { blob = null; }  // resolução cheia do sensor, se houver
+      if (!blob) { const c = document.createElement('canvas'); c.width = video.videoWidth; c.height = video.videoHeight; c.getContext('2d').drawImage(video, 0, 0); blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92)); }
+      const m = await addFotoSala(blob, s); n++; cnt.textContent = `${n} foto${n === 1 ? '' : 's'}`; ult.src = await urlFoto(m.id);
+    }).catch(x => toast('Foto não gravada: ' + x.message));
+  };
+  const el = h('div', { id: 'camera' }, video,
+    h('div', { class: 'cam-topo' }, h('b', {}, `📷 ${codSala(s)}`), h('span', {}, 'foto → foto → foto; o comentário fica para depois')),
+    h('div', { class: 'cam-barra' }, h('span', { class: 'cam-ult' }, ult, cnt),
+      h('button', { id: 'btnDisparo', 'aria-label': 'Tirar foto', onclick: disparar }),
+      h('button', { id: 'btnCamFim', class: 'primary', onclick: () => { if (!desempilhar('camera')) fim(); } }, 'Concluir')));
+  const fim = () => { stream.getTracks().forEach(t => t.stop()); fila.then(() => { el.remove(); if (S.painel) renderPainel(); }); };
+  document.body.append(el); empilhar('camera', fim);
+}
+// miniatura da sala: toque marca o ponto (coordenadas do mapa) onde a foto foi tirada
+function miniSala(s, ponto, aoMarcar) {
+  const NS = 'http://www.w3.org/2000/svg', plId = s.planta || S.planta, pl = S.seed.plantas[plId] || S.seed.plantas[S.planta];
+  let x0 = 0, y0 = 0, w = pl.w, hh = pl.h;
+  if (s.poly && s.poly.length) {
+    const xs = s.poly.map(p => p[0]), ys = s.poly.map(p => p[1]); const mx = Math.max(40, (Math.max(...xs) - Math.min(...xs)) * 0.12), my = Math.max(40, (Math.max(...ys) - Math.min(...ys)) * 0.12);
+    x0 = Math.min(...xs) - mx; y0 = Math.min(...ys) - my; w = Math.max(...xs) - Math.min(...xs) + 2 * mx; hh = Math.max(...ys) - Math.min(...ys) + 2 * my;
+  }
+  const svg = document.createElementNS(NS, 'svg'); svg.setAttribute('viewBox', `${x0} ${y0} ${w} ${hh}`); svg.id = 'miniSala'; svg.classList.add('mini-sala');
+  const im = document.createElementNS(NS, 'image'); im.setAttribute('href', S.plantaUrls[plId] || ''); im.setAttribute('width', pl.w); im.setAttribute('height', pl.h); svg.append(im);
+  if (s.poly) { const pg = document.createElementNS(NS, 'polygon'); pg.setAttribute('points', s.poly.map(p => p.join(',')).join(' ')); svg.append(pg); }
+  const pt = document.createElementNS(NS, 'circle'); pt.setAttribute('r', Math.max(w, hh) / 45); svg.append(pt);
+  const poe = p => { pt.style.display = p ? '' : 'none'; if (p) { pt.setAttribute('cx', p[0]); pt.setAttribute('cy', p[1]); } };
+  poe(ponto);
+  svg.addEventListener('click', ev => {
+    const m = svg.getScreenCTM(); if (!m) return; const q = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+    const p = [Math.round(q.x), Math.round(q.y)]; poe(p); aoMarcar(p);
+  });
+  svg.limpar = () => poe(null);
+  return svg;
+}
+async function editarFoto(id, s) {
+  const f = await DB.get('fotos', id); if (!f) return;
+  s = s || salaPorId(f.sala_id) || { id: f.sala_id, codigo: f.sala, planta: f.planta };
+  let ponto = f.ponto || null;
+  const daSala = grupoPorEquip(itensDaSala(s)).map(([tag, lst]) => [tag, lst[0].equip || '']);
+  const selEq = h('select', { name: 'equip', id: 'fotoEq' });
+  const montaEq = filtro => {
+    const val = selEq.options.length ? selEq.value : (f.equip || ''), t = (filtro || '').trim().toLowerCase(), passa = ([tag, nm]) => !t || `${tag} ${nm}`.toLowerCase().includes(t) || tag === val;
+    const op = ([tag, nm]) => h('option', { value: tag, selected: tag === val }, `${tag}${nm ? ' · ' + nm : ''}`);
+    const aqui = daSala.filter(passa), tags = new Set(daSala.map(x => x[0]));
+    const outros = t || (val && !tags.has(val)) ? S.seed.equips.filter(e => !tags.has(e.tag)).map(e => [e.tag, e.nome || '']).filter(passa).slice(0, 30) : [];
+    selEq.innerHTML = '';
+    selEq.append(h('option', { value: '', selected: !val }, '— nenhum —'), ...(aqui.length ? [h('optgroup', { label: 'Nesta sala' }, aqui.map(op))] : []), ...(outros.length ? [h('optgroup', { label: 'Outros equipamentos' }, outros.map(op))] : []));
+    if (val && ![...selEq.options].some(o => o.value === val)) selEq.append(h('option', { value: val, selected: true }, val));
+    selEq.value = val;
+  };
+  montaEq('');
+  const img = h('img', { class: 'foto-grande', alt: f.nome, src: await urlFoto(id) });
+  const mini = miniSala(s, ponto, p => { ponto = p; $('#fotoPonto').textContent = `ponto ${p[0]}, ${p[1]}`; });
+  const form = h('form', { class: 'ficha', id: 'fichaFoto', onsubmit: async ev => {
+    ev.preventDefault(); const fd = new FormData(form);
+    const novo = { ...(await DB.get('fotos', id)), com: (fd.get('com') || '').trim(), equip: fd.get('equip') || '', ponto, planta: f.planta || s.planta || S.planta, ts_edit: Date.now() };
+    await DB.put('fotos', novo);
+    const l = S.fotosSala.get(f.sala_id) || [], i = l.findIndex(x => x.id === id), { blob, ...m } = novo; if (i >= 0) l[i] = m;
+    await log('foto', id, 'registro', [novo.com, novo.equip, ponto ? `ponto ${ponto.join(',')}` : ''].filter(Boolean).join(' | '), { sala: f.sala_id });
+    fecharModal(); toast(`${id} atualizada`);
+  } },
+    h('h2', {}, `${id} · ${rotuloSala(s) || f.sala}`), h('p', { class: 'sub' }, `${fmtD(f.ts)} · origem: ${f.origem || 'app'} · ${f.nome}`), img,
+    h('div', { class: 'grid' },
+      h('label', { class: 'full' }, 'Comentário (só se a foto não deixar claro)', h('textarea', { name: 'com', id: 'fotoCom', rows: 2 }, f.com || '')),
+      h('div', { class: 'fl full' }, 'Equipamento (opcional)',
+        h('input', { type: 'search', id: 'fotoEqBusca', placeholder: 'Buscar tag ou nome…', autocomplete: 'off', oninput: ev => montaEq(ev.target.value) }), selEq),
+      h('div', { class: 'fl full' }, 'Ponto na planta (opcional): toque na miniatura da sala', mini,
+        h('div', { class: 'sub' }, h('span', { id: 'fotoPonto' }, ponto ? `ponto ${ponto[0]}, ${ponto[1]}` : 'sem ponto'), ' ',
+          h('button', { type: 'button', class: 'mini', id: 'btnLimparPonto', onclick: () => { ponto = null; mini.limpar(); $('#fotoPonto').textContent = 'sem ponto'; } }, 'Limpar ponto')))),
+    h('div', { class: 'acts' }, h('button', { type: 'button', onclick: fecharModal }, 'Cancelar'), h('button', { type: 'submit', class: 'primary', id: 'btnSalvarFoto' }, 'Salvar')));
   modal(form);
 }
 
@@ -1143,7 +1348,7 @@ export async function comprimir(file, max = 1600, q = 0.75) {
   const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', q));
   return { blob, w, h: hh };
 }
-async function addFoto(file, it, salaOverride) {
+async function addFoto(file, it, salaOverride, extra) {
   const seq = (S.meta.ftSeq || 0) + 1; S.meta.ftSeq = seq; await DB.put('meta', seq, 'ftSeq');
   const { blob, w, h: hh } = await comprimir(file);
   const o = it && est(it.id).onde; const so = o && salaPorId(o);
@@ -1151,8 +1356,9 @@ async function addFoto(file, it, salaOverride) {
   const id = `FT-${String(seq).padStart(4, '0')}`;
   const deSala = it && String(it.id).startsWith('SALA:');
   const nome = nomeArq(deSala ? `${hoje()}_${slug(sala)}_SALA_${id}.jpg` : `${hoje()}_${slug(sala)}_${it ? it.id : 'SEMITEM'}_${it ? slug(it.tag) : 'GERAL'}_${id}.jpg`);
-  const f = { id, item: it ? it.id : null, sala, nome, blob, w, h: hh, ts: Date.now(), exportado: 0, orig: file.name };
+  const f = { id, item: it ? it.id : null, sala, nome, blob, w, h: hh, ts: Date.now(), exportado: 0, orig: file.name || '', ...(extra || {}) };
   await DB.put('fotos', f);
+  if (f.reg) { const { blob: _b, ...m } = f; if (!S.fotosSala.has(f.sala_id)) S.fotosSala.set(f.sala_id, []); S.fotosSala.get(f.sala_id).push(m); }
   if (it) { const e = est(it.id); await setEstado(it.id, { fotos: [...e.fotos, id] }, 'foto', id); } else await log('foto', null, 'foto', id, { sala });
   return f;
 }
@@ -1338,10 +1544,11 @@ function telaResumo() {
     h('p', {}, `Alterações desde o último fechamento: `, h('b', { id: 'pend' }, String(S.meta.pendentes || 0)), ` · último: ${S.meta.ultimoFechamento ? fmtD(S.meta.ultimoFechamento) : 'nunca'} · espaço: `, est_),
     h('div', { class: 'acts left' },
       h('button', { class: 'primary big', id: 'btnFechar', onclick: () => fecharDia(false) }, '⬇ Fechar o dia (pacote ZIP)'),
+      h('button', { id: 'btnCompartilhar', onclick: compartilhar }, S.ultPac && !(S.meta.pendentes || 0) ? `📤 Compartilhar pacote (${S.ultPac.nome.replace(/^.*_(\d{8}-\d{4})\.zip$/, '$1')})` : '📤 Compartilhar pacote'),
       h('button', { onclick: () => fecharDia(true) }, 'Backup completo (todas as fotos)'),
-      h('label', { class: 'btn' }, '↺ Restaurar backup', h('input', { type: 'file', id: 'inRestaurar', accept: '.zip', hidden: true, onchange: async ev => {
+      h('label', { class: 'btn' }, '↺ Restaurar backup', h('input', { type: 'file', id: 'inRestaurar', accept: ACEITA_PACOTE, hidden: true, onchange: async ev => {
         const f = ev.target.files[0]; ev.target.value = ''; if (!f) return; try { await restaurar(f); } catch (x) { alert(x.message); } } })),
-      h('label', { class: 'btn' }, 'Importar pacote de dados', h('input', { type: 'file', id: 'inImportar', accept: '.zip,.json', hidden: true, onchange: async ev => {
+      h('label', { class: 'btn' }, 'Importar pacote de dados', h('input', { type: 'file', id: 'inImportar', accept: ACEITA_PACOTE, hidden: true, onchange: async ev => {
         const f = ev.target.files[0]; ev.target.value = ''; if (!f) return;
         try {
           if (S.salasEd.length) {
@@ -1439,10 +1646,14 @@ export async function montarPacote(completo) {
   const fotos = (await DB.all('fotos')).filter(f => completo || !f.exportado).map(f => ({ ...f, nome: nomeFoto(f.nome) }));  // pacotes antigos: "SALA:" no nome
   const eventos = (await DB.all('eventos')).filter(e => completo || !e.exportado);
   const estado = [...S.estado.values()].filter(e => e.ts);
-  const vist = (await DB.all('eventos')).filter(e => e.tipo === 'vistoria');
+  // janelas de sala: "vistoria" (ciclo 7: da 1ª à última ação) ou "inspecao" (ciclo 8: da abertura do painel à saída)
+  const vist = (await DB.all('eventos')).filter(e => e.tipo === 'vistoria').map(e => (e.modo === 'inspecao' ? { ...e, tipo: 'inspecao' } : e));
+  // registros das fotos de sala: sempre todos (comentário, equipamento e ponto podem ser editados depois do dia da foto)
+  const fotosSala = (await DB.all('fotos')).filter(f => f.reg).map(({ blob, ...r }) => ({ ...r, nome: nomeFoto(r.nome) }));
   const agora = new Date();
   const meta = { app: APP_VERSION, seed: S.seed.versao, gerado: agora.toISOString(), conferente: S.meta.conferente || '', completo: !!completo,
-                 n_itens: S.itens.length, n_estado: estado.length, n_eventos: eventos.length, n_fotos: fotos.length };
+                 n_itens: S.itens.length, n_estado: estado.length, n_eventos: eventos.length, n_fotos: fotos.length, n_fotos_sala: fotosSala.length,
+                 n_inspecao: vist.filter(e => e.tipo === 'inspecao').length };
   const demo = !!S.seed.demo;  // pacote de demonstração: marcado no nome e no conteúdo; o escritório recusa a importação
   if (demo) { meta.demo = true; meta.aviso = 'DEMONSTRAÇÃO – não entra no controle'; }
   const novos = await DB.all('novos');
@@ -1467,6 +1678,7 @@ ${foraL.length ? `<h3>${esc(ESC().rotulo_fora)} (${foraL.length})</h3><ul>${fora
     { name: 'eventos.json', data: JSON.stringify(eventos) },
     { name: 'novos.json', data: JSON.stringify(novos) },
     { name: 'vistorias.json', data: JSON.stringify(vist) },
+    { name: 'fotos_sala.json', data: JSON.stringify(fotosSala) },
     { name: 'fotos.json', data: JSON.stringify(fotos.map(({ blob, ...r }) => r)) },
     { name: 'resumo.html', data: resumo },
     ...fotos.map(f => ({ name: 'fotos/' + f.nome, data: f.blob })),
@@ -1480,10 +1692,7 @@ async function fecharDia(completo) {
   await encerrarVistoria();  // fechar o dia fecha a janela da sala atual
   const { zip, nome, fotos: fotosP, eventos } = await montarPacote(completo);
   const ids = new Set(fotosP.map(f => f.id)); const fotos = (await DB.all('fotos')).filter(f => ids.has(f.id));
-  const a = h('a', { href: URL.createObjectURL(zip), download: nome }); document.body.append(a); a.click(); a.remove();
-  if (navigator.canShare && navigator.canShare({ files: [new File([zip], nome, { type: 'application/zip' })] }) && !window.__TEST__) {
-    try { await navigator.share({ files: [new File([zip], nome, { type: 'application/zip' })], title: nome }); } catch (_) { /* usuário cancelou */ }
-  }
+  baixar(zip, nome); S.ultPac = { zip, nome };  // o pacote sempre é baixado; "Compartilhar pacote" manda o mesmo arquivo a outro app
   for (const f of fotos) { f.exportado = 1; f.nome = nomeFoto(f.nome); await DB.put('fotos', f); }
   for (const e of eventos) { e.exportado = 1; await DB.put('eventos', e); }
   S.meta.pendentes = 0; S.meta.ultimoFechamento = Date.now(); S.meta.pendDesde = null;
@@ -1492,10 +1701,30 @@ async function fecharDia(completo) {
   render(); toast(`${nome} gerado (${(zip.size / 1e6).toFixed(1)} MB)${S.meta.conferente ? '' : ' – ATENÇÃO: sem nome do conferente'}`);
 }
 
+function baixar(zip, nome) { const a = h('a', { href: URL.createObjectURL(zip), download: nome }); document.body.append(a); a.click(); a.remove(); }
+// "Compartilhar pacote": folha de compartilhamento do aparelho com o ZIP (para o app de nuvem). Se ainda não há pacote desta
+// sessão, ou há alterações novas, fecha o dia antes (o pacote também é baixado). Navegador que não compartilha arquivos: só o download.
+async function compartilhar() {
+  const novo = !S.ultPac || (S.meta.pendentes || 0) > 0;
+  if (novo) await fecharDia(false);
+  const { zip, nome } = S.ultPac; const file = new File([zip], nome, { type: 'application/zip' });
+  if (!(navigator.canShare && navigator.canShare({ files: [file] }))) {
+    if (!novo) baixar(zip, nome);
+    toast('Este navegador não compartilha este tipo de arquivo – o pacote foi baixado (pasta de downloads)'); return 'download';
+  }
+  try { await navigator.share({ files: [file], title: nome }); toast('Pacote entregue ao compartilhamento'); return 'share'; }
+  catch (x) {
+    // cancelado, ou o navegador recusou (pede um toque logo antes de abrir a folha, ou não aceita este tipo de arquivo): o pacote já foi baixado
+    toast(x && x.name === 'AbortError' ? 'Compartilhamento cancelado – o pacote está na pasta de downloads'
+      : 'O compartilhamento não abriu – o pacote está na pasta de downloads; toque de novo em "Compartilhar pacote" para tentar outra vez');
+    return 'pendente';
+  }
+}
+
 // ---------- inicialização ----------
 function telaSemDados() {
   const main = $('#main'); main.innerHTML = '';
-  const inp = h('input', { type: 'file', accept: '.zip,.json', id: 'seedfile', onchange: async ev => {
+  const inp = h('input', { type: 'file', accept: ACEITA_PACOTE, id: 'seedfile', onchange: async ev => {
     try { await importarArquivo(ev.target.files[0]); await iniciar(); } catch (x) { alert('Erro: ' + x.message); } } });
   const box = h('div', { class: 'boas' }, h('h2', {}, 'Bem-vindo ao App de Campo'),
     h('p', {}, 'Para começar, carregue o pacote de dados (arquivo .zip gerado pela Miana: itens, equipamentos e plantas). Os dados ficam só neste aparelho.'),
@@ -1541,6 +1770,7 @@ function pedirConferente(motivo) {
 }
 // atalho para os testes: abre a edição de forma de uma sala (o mesmo que ficha da sala → "Editar forma")
 function editarForma(id) { const s = salasDe(S.planta).find(x => x.id === id); if (!s) return false; S.edit = true; S.draw = null; S.edModo = 'vertices'; S.edTmp = { sala: s, poly: s.poly.map(p => [...p]) }; render(); return true; }
-window.__APP__ = { S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed };
+window.__APP__ = { S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed,
+  inspLigada, alternarInspecao, telaAbertura, telaCalibrar, fotosDaSala, addFotoSala, editarFoto, compartilhar, lembretes, isoLocal, qrSvg };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => { });
 iniciar();
