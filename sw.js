@@ -1,11 +1,12 @@
 // Service worker – cache do código do app (os dados ficam no IndexedDB)
-const CACHE = 'appcampo-32beb18a64';
+const CACHE = 'appcampo-f7055046d5';
 const CORE = ['./', 'index.html', 'css/app.css', 'js/app.js', 'js/db.js', 'js/zip.js', 'js/qr.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+  // só os caches desta versão do site ("appcampo-…"): a "versão anterior", publicada em outro endereço da mesma origem, usa outro prefixo
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE && k.startsWith('appcampo-')).map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
