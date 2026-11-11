@@ -12,14 +12,16 @@
 </head>
 <body>
 <div id="faixaDemo" role="alert" hidden>DEMONSTRAÇÃO – o que for registrado aqui não entra no controle</div>
+<div id="faixaInativo" role="alert" hidden>APARELHO INATIVO – os dados estão em outro aparelho</div>
 <header>
   <div class="brand"><b id="brandProj">App de Campo</b><span>Miana Consulting</span></div>
   <nav>
-    <button data-v="L0">L0 Térreo</button>
+    <button data-v="L0">L0<span class="hide-sm">&nbsp;Térreo</span></button>
     <button data-v="L1">L1</button>
     <button data-v="L2">L2</button>
     <button data-v="lista">Lista</button>
     <button data-v="equip"><span class="hide-sm">Equipamentos</span><span class="so-sm">Equip.</span></button>
+    <button data-v="quadro">Quadro</button>
     <button data-v="resumo">Resumo</button>
   </nav>
   <div id="topo">
