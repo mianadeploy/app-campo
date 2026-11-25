@@ -59,15 +59,19 @@ function comBlobs(v) {
 }
 const putCru = (store, val, key) => tx(store, 'readwrite', s => req(key === undefined ? s.put(val) : s.put(val, key)));
 
+// ciclo 18: modo ESPELHO – nada é gravado no aparelho enquanto estiver ligado
+let _soLeitura = false;
+export const soLeitura = v => { _soLeitura = !!v; };
 export const get = (store, key) => tx(store, 'readonly', s => req(s.get(key))).then(comBlobs);
 export async function put(store, val, key) {
+  if (_soLeitura) return undefined;
   if (!temBlob(val)) return putCru(store, val, key);
   if (!semBlob) { try { return await putCru(store, val, key); } catch { semBlob = true; } }
   return putCru(store, await semBlobs(val), key);
 }
-export const del = (store, key) => tx(store, 'readwrite', s => req(s.delete(key)));
+export const del = (store, key) => _soLeitura ? Promise.resolve() : tx(store, 'readwrite', s => req(s.delete(key)));
 export const all = (store) => tx(store, 'readonly', s => req(s.getAll())).then(l => l.map(comBlobs));
-export const clear = (store) => tx(store, 'readwrite', s => req(s.clear()));
+export const clear = (store) => _soLeitura ? Promise.resolve() : tx(store, 'readwrite', s => req(s.clear()));
 export const putMany = async (store, vals) => { for (const v of vals) await put(store, v); };
 export const blobComoBytes = () => semBlob;
 export const STORE_NAMES = STORES;

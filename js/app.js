@@ -4,7 +4,7 @@ import { makeZip, readZip } from './zip.js';
 import { qrSvg } from './qr.js';
 import { KB_COLS, KB_CSS, kbModelo, kbHtml, kbPos } from './kanban.js';
 
-export const APP_VERSION = '1.11.0';
+export const APP_VERSION = '1.12.0';
 const DITAR = 'use o microfone do teclado para ditar';
 const ACEITA_PACOTE = '.zip,.json,application/zip,application/x-zip-compressed,application/json,application/octet-stream';
 const ETAPAS = ['Conferido', 'Preparado', 'Desceu', 'Na doca', 'Embarcado'];
@@ -23,7 +23,7 @@ const prepBase = () => (S.seed && Array.isArray(S.seed.preparacao) && S.seed.pre
 const prepNorm = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 const prepFotos = p => (p && Array.isArray(p.fotos) ? p.fotos : (p && p.foto ? [p.foto] : []));
 const prepItens = () => { const b = prepBase(), ids = new Set(b.map(x => x.id)), nomes = new Set(b.map(x => prepNorm(x.nome)));
-  return [...b, ...Object.values(S.meta.prep || {}).filter(p => p && p.novo && !p.removido && !ids.has(p.id) && !nomes.has(prepNorm(p.nome))).sort((a, c) => (a.criado || 0) - (c.criado || 0)).map(p => ({ id: p.id, nome: p.nome, novo: 1 }))]; };
+  return [...b, ...Object.values(S.meta.prep || {}).filter(p => p && p.novo && !p.removido && !p.convertido && !ids.has(p.id) && !nomes.has(prepNorm(p.nome))).sort((a, c) => (a.criado || 0) - (c.criado || 0)).map(p => ({ id: p.id, nome: p.nome, novo: 1 }))]; };
 const S = { seed: null, itens: [], byId: new Map(), estado: new Map(), meta: {}, planta: 'L0', view: 'planta',
             zoom: { s: 1, x: 0, y: 0 }, painel: null, plantaUrls: {}, salasEd: [], edit: false, draw: null,
             filtro: null, abertos: {}, det: false, detIt: new Set(), eqSel: null, fq: {}, alias: {}, aliasInv: {}, fotosSala: new Map(), fotosPlaq: new Map(), thumbUrl: new Map(), ultPac: null };
@@ -112,6 +112,7 @@ const nomeMarca = s => s.nome || s.codigo || s.id;
 async function proxSeq(chave) { const n = ((await DB.get('meta', chave)) || 0) + 1; await DB.put('meta', n, chave); return n; }
 const idAtual = () => (S.meta.vistoria && S.meta.vistoria.abriu ? S.meta.vistoria.sala : null);
 async function entrouSala(s) {
+  if (espelho()) return;
   const agora = Date.now(), o = oficialDe(s);
   if (S.meta.vistoria) await encerrarVistoria(agora);
   S.meta.vistoria = { sala: o.id, rot: codSala(o), abriu: agora, ini: agora, ult: null, n: 0, fora: null, insp: 1, seq: await proxSeq('inspSeq'), telas: [],
@@ -150,6 +151,7 @@ function renderTopo() {
 }
 // "Mostrar QR": a tela de abertura da janela desta sala; se a janela já fechou (2 min na planta, fechar o dia), abre outra
 async function mostrarQR(s) {
+  if (espelho()) return;
   const v = S.meta.vistoria;
   if (!v || v.sala !== oficialDe(s).id) await entrouSala(s);
   if (!$('#abertura')) telaAbertura(s);
@@ -265,6 +267,7 @@ const conferidos = lista => ativos(lista).filter(it => est(it.id).c[0]).length;
 const pendEtapa = (lista, k) => ativos(lista).filter(i => proxima(i) === k).length;
 
 async function log(tipo, id, campo, valor, extra = {}) {
+  if (espelho()) return;
   const ts = Date.now();
   await DB.put('eventos', { ts, tipo, id, campo, valor, exportado: 0, ...extra });
   if (tipo === 'item' || tipo === 'lote' || tipo === 'foto') await acaoNaSala(ts);
@@ -292,16 +295,18 @@ async function carregarAparelho() {
   S.meta.aparelho = a;
 }
 const inativo = () => !!(S.meta.aparelho && S.meta.aparelho.ativo === false);
+const espelho = () => !!S.meta.espelho;   // ciclo 18: app aberto no PC só para ver
 class Inativo extends Error { constructor() { super('aparelho inativo'); this.inativo = true; } }
 // registrar num aparelho inativo: pede confirmação explícita, uma vez por sessão (fica no histórico); sem ela, nada é gravado
 function podeRegistrar() {
+  if (espelho()) { const x = new Error('espelho'); x.espelho = true; throw x; }
   if (!inativo() || S._regInativo) return;
   if (!confirm('APARELHO INATIVO – os dados estão em outro aparelho.\n\nO que for registrado aqui pode conflitar com o que está sendo feito no outro aparelho. '
     + 'O certo é receber o trabalho de volta por "Restaurar backup" (Resumo).\n\nRegistrar aqui mesmo assim?')) throw new Inativo();
   S._regInativo = true;
   DB.put('eventos', { ts: Date.now(), tipo: 'sistema', id: null, campo: 'registro em aparelho inativo', valor: S.meta.aparelho.nome, exportado: 0 });
 }
-window.addEventListener('unhandledrejection', ev => { if (ev.reason && ev.reason.inativo) { ev.preventDefault(); toast('Nada foi registrado: este aparelho está inativo'); } });
+window.addEventListener('unhandledrejection', ev => { if (ev.reason && ev.reason.espelho) { ev.preventDefault(); toast('ESPELHO – só leitura: nada foi registrado'); return; } if (ev.reason && ev.reason.inativo) { ev.preventDefault(); toast('Nada foi registrado: este aparelho está inativo'); } });
 
 async function setEstado(id, patch, campo, valor) {
   podeRegistrar();
@@ -404,6 +409,7 @@ function salaDoEquip(tag) {
 
 // ---------- carga ----------
 async function carregar() {
+  S.meta.espelho = (await DB.get('meta', 'espelho')) || null; DB.soLeitura(!!S.meta.espelho);   // ciclo 18: antes de qualquer gravação
   await carregarAparelho(); S.meta.prep = (await DB.get('meta', 'prep')) || {}; S.meta.sn = (await DB.get('meta', 'sn')) || {}; S.meta.diario = (await DB.get('meta', 'diario')) || {}; S._horas = null;   // o kanban relê as horas das etapas depois de carregar ou restaurar
   const seed = await DB.get('meta', 'seed');
   if (!seed) return false;
@@ -415,7 +421,7 @@ async function carregar() {
   S.byId = new Map(S.itens.map(i => [i.id, i]));
   S.estado = new Map((await DB.all('estado')).map(e => [e.id, e]));
   S.salasEd = await DB.all('salas');
-  for (const k of ['pendentes', 'ultimoFechamento', 'ultFech', 'ftSeq', 'novoSeq', 'conferente', 'vistoria', 'pendDesde', 'recentes', 'shareRecusado', 'lembDrive']) S.meta[k] = await DB.get('meta', k);
+  for (const k of ['pendentes', 'ultimoFechamento', 'ultFech', 'ftSeq', 'novoSeq', 'conferente', 'vistoria', 'pendDesde', 'recentes', 'shareRecusado', 'lembDrive', 'apelidosPC', 'voltas']) S.meta[k] = await DB.get('meta', k);
   await unificarPrep();   // v1.7.0: item da Preparação feito à mão que chegou no pacote de dados com o mesmo nome
   // nome da sala no Schedule (ex.: DOCA) ↔ sala da planta: "Onde está agora" pode guardar um ou outro
   S.alias = {}; S.aliasInv = {};
@@ -480,6 +486,9 @@ async function importarArquivo(file) {
     await importarSeed(JSON.parse(await file.text()));
   } else {
     const z = await readZip(file);
+    if (tipoPacote(z) === 'espelho') return entrarEspelho(file, z);
+    if (espelho()) throw new Error('ESPELHO – só leitura. Saia do espelho antes de carregar outro pacote.');
+    if (tipoPacote(z) === 'volta') { if (!S.seed) throw new Error('Este é um pacote de volta do escritório. Carregue primeiro o pacote de dados.'); toast('Há atualização do escritório neste arquivo'); return receberEscritorio(file, z); }
     if (!z['seed.json']) throw new Error('O ZIP não tem seed.json');
     const seed = JSON.parse(new TextDecoder().decode(z['seed.json']));
     const imgs = {};
@@ -506,6 +515,7 @@ function renderStatus() {
   renderTopo();
   const fx = $('#faixaDemo'); if (fx) fx.hidden = !(S.seed && S.seed.demo); document.body.classList.toggle('demo', !!(S.seed && S.seed.demo));
   const fi = $('#faixaInativo'); if (fi) fi.hidden = !inativo(); document.body.classList.toggle('inativo', inativo());
+  const fe = $('#faixaEspelho'); if (fe) { fe.hidden = !espelho(); if (espelho()) { $('#faixaEspelhoTxt').textContent = `ESPELHO – só leitura · estado do escritório de ${fmtD(S.meta.espelho.gerado)}`; $('#btnSairEspelho').onclick = sairEspelho; } } document.body.classList.toggle('espelho', espelho());
 }
 // Lista, Resumo e Equipamentos são uma camada sobre a planta: o voltar retorna à planta, com o zoom de antes
 function nav(view) {
@@ -568,10 +578,13 @@ function nomeOficial(o) { return [o.codigo && o.codigo !== '?' && o.codigo !== o
 function rotuloSala(s) {
   if (!s) return '';
   if (s.tipo === 'marca') { const uso = s.nome || s.codigo; const o = salaSob(s); return o && nomeOficial(o) ? `${uso} · ${nomeOficial(o)}` : uso; }
-  return `${codigosDe(s)}${s.nome && s.nome !== s.codigo ? ' · ' + s.nome : ''}`;
+  const ap_ = (S.meta.apelidosPC || {})[s.id];
+  return `${codigosDe(s)}${ap_ ? ' · ' + ap_ : ''}${s.nome && s.nome !== s.codigo ? ' · ' + s.nome : ''}`;
 }
 // sala unificada (ex.: duas salas juntadas numa só): o rótulo leva todos os códigos oficiais – "L1.P.101 + L1.P.102 · NOME"
 function codigosDe(s) { return Array.isArray(s.codigos) && s.codigos.length > 1 ? s.codigos.join(' + ') : (s.codigo && s.codigo !== '?' ? s.codigo : s.id); }
+// ciclo 18: código pequeno no rótulo da planta – a sala que juntou muitas mostra o primeiro e quantas mais
+function codigoCurto(s) { const c = Array.isArray(s.codigos) ? s.codigos : []; return c.length > 3 ? `${c[0]} +${c.length - 1}` : codigosDe(s); }
 // todos os itens de uma planta-detalhe (a sala limpa): os da sala de origem dela, os criados nela e os movidos para uma área dela
 function itensDaPlanta(pl) {
   const p = S.seed.plantas[pl] || {}; const ids = new Set(salasDe(pl).map(x => x.id));
@@ -621,12 +634,13 @@ function telaPlanta() {
     svg.append(pg);
     const lx = s.label ? s.label[0] : s.poly.reduce((a, p) => a + p[0], 0) / s.poly.length;
     const ly = s.label ? s.label[1] : s.poly.reduce((a, p) => a + p[1], 0) / s.poly.length;
-    if (its.length || s.tipo !== 'sala') {
+    const nomeada = s.tipo === 'sala' && !!s.nome && (/^NOVA-/.test(s.id) || (s.juntou || []).length > 0);   // ciclo 18: área do escritório ou sala unificada
+    if (its.length || s.tipo !== 'sala' || nomeada) {
       layer.append(h('span', { class: 'dot dot-' + s.tipo, style: `left:${lx}px;top:${ly}px;--c:${cor(pr)}`, 'data-dot': s.id }));
-      const tit = s.tipo === 'sala' ? (s.codigo !== '?' ? codigosDe(s) : s.id) : s.tipo === 'bloco' ? `${s.codigo} ▸` : s.tipo === 'externa' ? s.codigo : s.nome;
-      layer.append(h('button', { class: `pin pin-${s.tipo}`, style: `left:${lx}px;top:${ly}px;--c:${s.tipo === 'marca' ? (COR_MARCA[s.marca] || '#555') : cor(pr)}`,
+      const tit = nomeada ? s.nome : s.tipo === 'sala' ? (s.codigo !== '?' ? codigosDe(s) : s.id) : s.tipo === 'bloco' ? `${s.codigo} ▸` : s.tipo === 'externa' ? s.codigo : s.nome;
+      layer.append(h('button', { class: `pin pin-${s.tipo}` + (nomeada ? ' pin-nomeada' + (its.length ? '' : ' so-rotulo') : ''), style: `left:${lx}px;top:${ly}px;--c:${s.tipo === 'marca' ? (COR_MARCA[s.marca] || '#555') : cor(pr)}`,
         'data-pin': s.tipo === 'sala' && s.codigo !== '?' ? s.codigo : s.id, 'data-sala': s.id, onclick: ev => { ev.stopPropagation(); tocarSala(s); } },
-        h('b', {}, tit), its.length ? h('small', {}, `${cf}/${its.length}`) : null));
+        h('b', {}, tit), nomeada ? h('i', { class: 'pcod' }, codigoCurto(s)) : null, its.length ? h('small', {}, `${cf}/${its.length}`) : null));
     } else if (s.codigo && s.codigo !== '?') {
       layer.append(h('span', { class: 'lbl', style: `left:${lx}px;top:${ly}px` }, s.codigo.replace(/^L\d\.P\./, '')));
     }
@@ -1356,6 +1370,7 @@ async function apagarComConfirmacao(id, depois) {
 }
 const btnApagar = (id, depois) => h('button', { type: 'button', class: 'mini apagar', 'data-apagar': id, title: 'Apagar esta foto', onclick: async ev => { ev.stopPropagation(); ev.preventDefault(); await apagarComConfirmacao(id, depois); } }, '🗑 Apagar');
 async function addFotoSala(file, s) {
+  podeRegistrar();
   const o = oficialDe(s);  // foto tirada numa marcação: fica na sala oficial, com a marcação guardada
   return addFoto(file, { id: 'SALA:' + o.id, tag: 'SALA' }, o.codigo && o.codigo !== '?' ? o.codigo : o.id,
     { sala_id: o.id, planta: o.planta || s.planta || S.planta, origem: 'app', com: '', equip: '', ponto: null, reg: 1, ...(o !== s ? { marcacao: nomeMarca(s), marca_id: s.id } : {}) });
@@ -1661,6 +1676,7 @@ export async function comprimir(file, max = 1600, q = 0.75) {
   return { blob, w, h: hh };
 }
 async function addFoto(file, it, salaOverride, extra) {
+  podeRegistrar();
   podeRegistrar();
   const seq = (S.meta.ftSeq || 0) + 1; S.meta.ftSeq = seq; await DB.put('meta', seq, 'ftSeq');
   const { blob, w, h: hh } = await comprimir(file);
@@ -2098,6 +2114,8 @@ function telaResumo() {
       h('button', { class: 'primary big', id: 'btnFechar', onclick: () => fecharDia(false, false, true) }, '⬇ Fechar o dia (pacote ZIP)'),
       // v1.7.1: onde o navegador não compartilha ZIP, o botão diz o que de fato faz (baixa o pacote de novo)
       h('button', { id: 'btnCompartilhar', 'data-share': semShareZip() ? '0' : '1', onclick: compartilhar }, (semShareZip() ? '⬇ Baixar o pacote de novo' : '📤 Compartilhar pacote') + (S.ultPac && !S.ultPac.backup && !(S.meta.pendentes || 0) ? ` (${S.ultPac.nome.replace(/^.*_(\d{8}-\d{4})\.zip$/, '$1')})` : '')),
+      h('label', { class: 'btn', id: 'btnVolta' }, '🏢 Receber do escritório', h('input', { type: 'file', id: 'inVolta', accept: ACEITA_PACOTE, hidden: true, onchange: async ev => {
+        const f = ev.target.files[0]; ev.target.value = ''; if (!f) return; try { await receberEscritorio(f); } catch (x) { alert(x.message); } } })),
       h('button', { id: 'btnRecebidas', onclick: () => telaRecebidas() }, '📥 Anexar fotos recebidas'),
       h('button', { id: 'btnBackup', onclick: () => fecharDia(true) }, 'Backup completo (todas as fotos)'),
       h('label', { class: 'btn' }, '↺ Restaurar backup', h('input', { type: 'file', id: 'inRestaurar', accept: ACEITA_PACOTE, hidden: true, onchange: async ev => {
@@ -2242,6 +2260,7 @@ function perguntarEdicoes(n) {
 }
 // restaurar: BACKUP_*.zip (tudo) ou o último pacote do dia (estado completo + fotos daquele dia) → estado, fotos, salas editadas, itens novos
 async function restaurar(file) {
+  if (espelho()) throw new Error('ESPELHO – só leitura. Saia do espelho para restaurar um backup.');
   if (!S.seed) throw new Error('Carregue primeiro o pacote de dados (o backup traz o estado, não as plantas).');
   const z = await readZip(file); const td = n => z[n] ? JSON.parse(new TextDecoder().decode(z[n])) : null;
   const meta = td('meta.json'), estado = td('estado.json');
@@ -2376,6 +2395,7 @@ ${foraL.length ? `<h3>${esc(ESC().rotulo_fora)} (${foraL.length})</h3><ul>${fora
 // v1.7.0 – enviar = true (botão "Fechar o dia"): terminado o pacote, abre direto a folha de compartilhar do aparelho com o ZIP (um toque a
 // menos) e mostra o aviso de fechamento no Resumo, com a dica da pasta e o botão grande "Enviar para o Drive" (ver enviarPacote).
 async function fecharDia(completo, quieto, enviar) {
+  if (espelho()) { toast('ESPELHO – só leitura: não gera pacote'); return 'espelho'; }
   if (!S.meta.conferente) await pedirConferente('O pacote do dia leva o nome de quem conferiu.');
   await encerrarVistoria();  // fechar o dia fecha a janela da sala atual
   if (completo) {
@@ -2707,6 +2727,99 @@ function formFato(tipo, r, pre = '') {
   modal(form); desenha();
 }
 
+// ---------- ciclo 18 (v1.12.0): "Receber do escritório" – o que o PC registrou volta para o aparelho (tools/pacote_volta.py) ----------
+// Regra por campo: vale o registro mais recente. Se o aparelho mexeu no mesmo campo DEPOIS do PC, fica o do aparelho e a tela lista "mantido o do aparelho".
+// Nada se perde: os eventos do PC entram no histórico. Nada aqui conta como "alteração a fechar" (exportado: 1). O mesmo pacote duas vezes não muda nada.
+const tipoPacote = z => { try { return z['meta.json'] ? JSON.parse(new TextDecoder().decode(z['meta.json'])).tipo || '' : ''; } catch { return ''; } };
+const CAMPO_EV = { Conferido: c => c === 'Conferido', com: c => c.split(',').includes('com'), partes_n: c => c === 'partes vistas' || c.split(',').includes('partes_n') };
+const ROT_CAMPO = { Conferido: 'Conferido', com: 'comentário', partes_n: 'partes vistas', sala: 'sala da foto', equip: 'equipamento da foto' };
+async function receberEscritorio(file, zPronto) {
+  if (espelho()) throw new Error('ESPELHO – só leitura. O pacote do escritório entra no aparelho de campo.');
+  if (!S.seed) throw new Error('Carregue primeiro o pacote de dados.');
+  const z = zPronto || await readZip(file), td = n => z[n] ? JSON.parse(new TextDecoder().decode(z[n])) : null, meta = td('meta.json'), v = td('volta.json');
+  if (!meta || meta.tipo !== 'volta' || !v) throw new Error('Este ZIP não é um pacote de volta do escritório (PACOTE_VOLTA_…).');
+  if (!!meta.demo !== !!S.seed.demo) throw new Error('Pacote de volta e dados deste aparelho não são do mesmo tipo (demonstração × controle).');
+  const voltas = (await DB.get('meta', 'voltas')) || [];
+  if (voltas.some(x => x.id === meta.volta_id)) { const r = { repetido: true, aplicados: 0, mantidos: [], fotos: 0 }; window.__VOLTA__ = r; modal(h('div', { class: 'ficha', id: 'voltaResumo' }, h('h2', {}, 'Já recebido'), h('p', { id: 'voltaTxt' }, 'Este pacote do escritório já foi recebido neste aparelho. Nada mudou.'), h('div', { class: 'acts' }, h('button', { type: 'button', id: 'btnVoltaOk', onclick: fecharModal }, 'Fechar')))); return r; }
+  const evs = await DB.all('eventos'), tsLocal = (id, campo) => evs.reduce((m, e) => (e.tipo === 'item' && e.id === id && !e.pc && CAMPO_EV[campo](String(e.campo || '')) ? Math.max(m, e.ts || 0) : m), 0);
+  const mantidos = [], sem = []; let aplicados = 0, nFotos = 0; const nomeIt = id => { const i = S.byId.get(id); return i ? `${id} ${i.tag || ''}`.trim() : id; };
+  for (const c of v.campos || []) {
+    if (!S.byId.has(c.id)) { sem.push(c.id); continue; }
+    const e = { ...est(c.id), c: [...est(c.id).c] }, depois = tsLocal(c.id, c.campo) > (c.ts || 0);
+    const igual = c.campo === 'Conferido' ? !!e.c[0] === !!c.valor : c.campo === 'com' ? String(e.com || '').includes(c.valor) : (+e.partes_n || 0) === +c.valor;
+    if (igual) continue;
+    if (depois || (c.campo === 'Conferido' && c.valor && (e.fora || e.diverg))) { mantidos.push({ id: c.id, campo: c.campo, txt: `${nomeIt(c.id)} – ${ROT_CAMPO[c.campo]}` }); continue; }
+    if (c.campo === 'Conferido') { e.c[0] = c.valor ? 1 : 0; if (c.valor && !e.enc) e.enc = 'S'; }
+    else if (c.campo === 'com') e.com = e.com ? `${e.com} | ${c.valor}` : c.valor;
+    else e.partes_n = +c.valor;
+    e.ts = Math.max(e.ts || 0, c.ts || 0); S.estado.set(c.id, e); await DB.put('estado', e); aplicados++;
+  }
+  for (const f of v.fotos || []) {   // só fotos originadas no PC; a que já está aqui não entra de novo
+    const dado = z['fotos/' + f.nome]; if (!dado || await DB.get('fotos', f.id)) continue;
+    await DB.put('fotos', { ...f, blob: new Blob([dado], { type: 'image/jpeg' }), exportado: 1, do_pc: 1 }); nFotos++;
+    if (f.item && !String(f.item).startsWith('SALA:') && S.byId.has(f.item)) { const e = { ...est(f.item) }; e.fotos = [...new Set([...(e.fotos || []), f.id])]; e.ts = Math.max(e.ts || 0, f.ts || 0); S.estado.set(f.item, e); await DB.put('estado', e); }
+  }
+  const salasOk = new Set(todasSalas().map(x => x.id));
+  for (const c of v.correcoes || []) {
+    const f = await DB.get('fotos', c.id); if (!f) continue;
+    const dif = ('sala_id' in c && String(f.item || '').startsWith('SALA:') && f.sala_id !== c.sala_id) || ('equip' in c && (f.equip || '') !== (c.equip || '')); if (!dif) continue;
+    if ((f.ts_edit || 0) > (c.ts || 0)) { mantidos.push({ id: c.id, campo: 'sala', txt: `foto ${c.id} – sala/equipamento` }); continue; }
+    const pt = {}; if ('equip' in c) pt.equip = c.equip;
+    if ('sala_id' in c && String(f.item || '').startsWith('SALA:')) { if (salasOk.has(c.sala_id)) Object.assign(pt, { sala_id: c.sala_id, item: 'SALA:' + c.sala_id, sala: c.sala }); else sem.push(c.sala_id); }
+    if (Object.keys(pt).length) { await DB.put('fotos', { ...f, ...pt, corr_pc: c.ts || 1 }); aplicados++; }
+  }
+  const prep = { ...(S.meta.prep || {}) }; let nConv = 0;   // convertido para o Diário: fica marcado (o histórico e as fotos ficam), só sai da lista
+  for (const c of v.convertidos || []) if (prep[c.id] && !prep[c.id].convertido) { prep[c.id] = { ...prep[c.id], convertido: 1, convertido_em: c.quando || '' }; nConv++; }
+  if (nConv) { S.meta.prep = prep; await DB.put('meta', prep, 'prep'); }
+  if (v.apelidos) { S.meta.apelidosPC = v.apelidos; await DB.put('meta', v.apelidos, 'apelidosPC'); }
+  const chave = e => `${e.ts}|${e.tipo}|${e.id}|${e.campo}`, tem = new Set(evs.map(chave));
+  for (const e of v.eventos || []) if (!tem.has(chave(e))) { tem.add(chave(e)); await DB.put('eventos', { ...e, exportado: 1, pc: 1 }); }
+  for (const m of mantidos) await DB.put('eventos', { ts: Date.now(), tipo: 'sistema', id: m.id, campo: 'mantido o do aparelho', valor: ROT_CAMPO[m.campo], exportado: 1, pc: 1 });
+  await DB.put('eventos', { ts: Date.now(), tipo: 'sistema', id: null, campo: 'recebido do escritório', valor: `${file.name} (${aplicados} campos, ${nFotos} fotos, ${mantidos.length} mantidos)`, exportado: 1, pc: 1 });
+  S.meta.voltas = [...voltas, { id: meta.volta_id, nome: file.name, ts: Date.now(), aplicados, fotos: nFotos, convertidos: nConv, mantidos: mantidos.length }]; await DB.put('meta', S.meta.voltas, 'voltas');
+  await carregar(); render();
+  const r = { aplicados, fotos: nFotos, convertidos: nConv, mantidos, sem: [...new Set(sem)] }; window.__VOLTA__ = r;
+  modal(h('div', { class: 'ficha', id: 'voltaResumo' }, h('h2', {}, 'Recebido do escritório'),
+    h('p', { id: 'voltaTxt' }, `${aplicados} registro(s) atualizado(s) · ${nFotos} foto(s) · ${nConv} item(ns) da Preparação convertido(s) para o Diário.`),
+    mantidos.length ? h('div', { id: 'voltaMantidos' }, h('b', {}, `Mantido o do aparelho (${mantidos.length}):`), h('ul', {}, ...mantidos.map(m => h('li', {}, m.txt)))) : null,
+    r.sem.length ? h('p', { class: 'sub' }, `Não existem nos dados deste aparelho (importe o pacote de dados novo): ${r.sem.join(', ')}`) : null,
+    h('p', { class: 'sub' }, 'Isto não conta como alteração a fechar.'), h('div', { class: 'acts' }, h('button', { type: 'button', class: 'primary', id: 'btnVoltaOk', onclick: fecharModal }, 'Fechar'))));
+  return r;
+}
+
+// ---------- ciclo 18: modo ESPELHO (tools/pacote_espelho.py) – o dono navega no PC; não grava, não gera pacote, não vira aparelho ativo ----------
+// Só entra num navegador SEM registros de campo: o espelho substitui o que há no aparelho, e num celular de trabalho isso apagaria dados.
+async function entrarEspelho(file, z) {
+  const td = n => z[n] ? JSON.parse(new TextDecoder().decode(z[n])) : null, meta = td('meta.json'), e = td('espelho.json'), seed = td('seed.json');
+  if (!meta || meta.tipo !== 'espelho' || !e || !seed) throw new Error('Este ZIP não é um pacote espelho.');
+  if (!espelho()) {
+    const evs = await DB.all('eventos'), tem = evs.some(x => x.tipo !== 'sistema') || (await DB.all('fotos')).length || (await DB.all('estado')).length || (await DB.all('novos')).length || (await DB.all('salas')).length;
+    if (tem) throw new Error('Este aparelho tem registros de campo: o espelho não entra aqui, para não apagar nada. Abra o espelho no Chrome do PC. Nada foi alterado.');
+  }
+  DB.soLeitura(false);
+  for (const st of ['meta', 'estado', 'fotos', 'eventos', 'novos', 'arquivos', 'salas']) await DB.clear(st);
+  await DB.put('meta', seed, 'seed');
+  for (const nv of Object.keys(seed.plantas)) {
+    const k = Object.keys(z).find(n => n.endsWith(`plantas/${nv}.jpg`)); if (k) await DB.put('arquivos', new Blob([z[k]], { type: 'image/jpeg' }), 'planta_' + nv);
+    const alt = seed.plantas[nv].img_sem_eq, k2 = alt && Object.keys(z).find(n => n.endsWith(alt)); if (k2) await DB.put('arquivos', new Blob([z[k2]], { type: 'image/jpeg' }), 'planta_' + nv + '~sem');
+  }
+  for (const x of e.estado || []) await DB.put('estado', x);
+  for (const x of e.novos || []) await DB.put('novos', x);
+  for (const f of e.fotos || []) { const d = z['fotos/' + f.nome]; if (d) await DB.put('fotos', { ...f, blob: new Blob([d], { type: 'image/jpeg' }), exportado: 1 }); }
+  await DB.put('meta', Object.fromEntries((e.preparacao || []).filter(p => p && p.id).map(p => [p.id, p])), 'prep');
+  await DB.put('meta', Object.fromEntries((e.seriais || []).filter(r => r && r.tag).map(r => [r.tag, r])), 'sn');
+  await DB.put('meta', Object.fromEntries((e.diario || []).filter(r => r && r.id).map(r => [r.id, r])), 'diario');
+  await DB.put('meta', { gerado: meta.gerado, arquivo: file.name, n_fotos: (e.fotos || []).length }, 'espelho');
+  DB.soLeitura(true); await carregar(); fecharModal(); S.view = 'planta'; S.zoom._nv = null;
+  if (document.querySelector('nav button')) await iniciar();
+  return 'espelho';
+}
+async function sairEspelho() {
+  if (!confirm('Sair do espelho? A cópia de leitura sai deste navegador. Os dados do escritório não mudam.')) return;
+  DB.soLeitura(false); for (const st of ['meta', 'estado', 'fotos', 'eventos', 'novos', 'arquivos', 'salas']) await DB.clear(st);
+  location.reload();
+}
+
 // ---------- inicialização ----------
 function telaSemDados() {
   const main = $('#main'); main.innerHTML = '';
@@ -2739,6 +2852,7 @@ export async function iniciar() {
   pararRepetir(S._tique); S._tique = repetir(tique, 15e3, 'janela da sala');
   render();
   if (S.meta.lembDrive && !S.meta.lembDrive.ok && bloqueiaDrive()) telaBloqueioDrive();
+  if (espelho()) return;   // ciclo 18: só leitura – sem pedir conferente e sem aviso de fechamento
   if (!S.meta.conferente) pedirConferente(); else setTimeout(avisoSemFechar, 300);
 }
 // nome do conferente: pedido na primeira abertura (dá para trocar no Resumo); pacote sem conferente sai com aviso
@@ -2757,7 +2871,7 @@ function pedirConferente(motivo) {
 }
 // atalho para os testes: abre a edição de forma de uma sala (o mesmo que ficha da sala → "Editar forma")
 function editarForma(id) { const s = salasDe(S.planta).find(x => x.id === id); if (!s) return false; S.edit = true; S.draw = null; S.edModo = 'vertices'; S.edTmp = { sala: s, poly: s.poly.map(p => [...p]) }; render(); return true; }
-window.__APP__ = { partesFaltam, prepComs, conferirTodos, setDiario, diLista, abrirDiario, alternarDestaque, snTxt, setSN, snVerif, snNorm, telaSN, SN_TXT, toggleEtapa, marcarFora, apagarFoto, apagarComConfirmacao, loteFora, volumesKanban, kbModelo, kbPos, horasEtapas, S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed,
+window.__APP__ = { partesFaltam, prepComs, conferirTodos, setDiario, diLista, abrirDiario, alternarDestaque, snTxt, setSN, snVerif, snNorm, telaSN, SN_TXT, toggleEtapa, marcarFora, apagarFoto, apagarComConfirmacao, loteFora, volumesKanban, kbModelo, kbPos, horasEtapas, S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed, receberEscritorio, entrarEspelho, espelho,
   oficialDe, mostrarQR, entrouSala, diferenca, etAtual, crPend, setCrated, crateTodos, entregarAparelho, restaurar, inativo, prepItens, ficha, fecharDia, enviarPacote, anexarRecebidas, telaRecebidas, dataExif, estadoBateria, prepFotos, unificarPrep, gerarDeNovo, telaAbertura, telaCalibrar, fotosDaSala, addFotoSala, editarFoto, compartilhar, lembretes, isoLocal, qrSvg };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => { });
 iniciar();
