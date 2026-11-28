@@ -4,7 +4,7 @@ import { makeZip, readZip } from './zip.js';
 import { qrSvg } from './qr.js';
 import { KB_COLS, KB_CSS, kbModelo, kbHtml, kbPos } from './kanban.js';
 
-export const APP_VERSION = '1.12.0';
+export const APP_VERSION = '1.13.0';
 const DITAR = 'use o microfone do teclado para ditar';
 const ACEITA_PACOTE = '.zip,.json,application/zip,application/x-zip-compressed,application/json,application/octet-stream';
 const ETAPAS = ['Conferido', 'Preparado', 'Desceu', 'Na doca', 'Embarcado'];
@@ -319,6 +319,11 @@ const partesM = it => +(it && it.partes_m) || 0;
 const partesN = it => Math.min(+est(it.id).partes_n || 0, partesM(it));
 const partesFaltam = (it, n = partesN(it)) => partesM(it) > 0 && n < partesM(it);
 const confirmaPartes = (it, n = partesN(it)) => !partesFaltam(it, n) || confirm(`${it.vol || it.id}: partes vistas ${n} de ${partesM(it)}. Conferir mesmo assim?`);
+// ciclo 20 (v1.13.0): comportamentos novos. Nos testes antigos (window.__TEST__) ficam desligados, a não ser que o teste peça (window.__C20__ = { ficha, troca, galeria, fechar, zoom });
+// no aparelho valem sempre. Mesmo padrão de bloqueiaDrive (__BLOQUEIO_DRIVE__).
+const c20 = k => !window.__TEST__ || !!(window.__C20__ && window.__C20__[k]);
+// ciclo 20: "Conferido" = encontrado. Volume conferido antes da v1.10.2 sem "encontrado" marcado conta como encontrado no app (o histórico não muda).
+const encDe = e => e.enc || (e.c && e.c[0] && !e.fora && !e.diverg ? 'S' : '');
 async function toggleEtapa(it, k) {
   if (k === 2 && !it.elev) return;
   const c = [...est(it.id).c]; c[k] = c[k] ? 0 : 1;
@@ -672,7 +677,9 @@ function telaPlanta() {
   const sub = pl.pai ? h('div', { class: 'subbar' },
     h('button', { id: 'btnVoltar', class: 'primary', onclick: () => entrarPlanta(pl.pai) }, `← Voltar ao ${pl.pai}`),
     h('b', {}, pl.titulo || pl.nome),
-    h('button', { class: 'chip sm', id: 'btnSLtodos', onclick: () => abrirSala({ id: '__SL__', planta: S.planta, tipo: 'area', codigo: pl.titulo || 'Sala limpa', nome: 'todos os itens' }) }, 'Todos os itens'),
+    S.planta !== 'SL' ? null : h('button', { class: 'chip sm', id: 'btnSLtodos', onclick: () => abrirSala({ id: '__SL__', planta: S.planta, tipo: 'area', codigo: pl.titulo || 'Sala limpa', nome: 'todos os itens' }) }, 'Todos os itens'),
+    // ciclo 20: entre as plantas-detalhe de um mesmo andar (sala de geradores: térreo ↔ pavimento superior), um toque
+    ...(S.planta === 'SL' ? [] : Object.entries(S.seed.plantas).filter(([k, p]) => k !== S.planta && k !== 'SL' && p.pai === pl.pai).map(([k, p]) => h('button', { class: 'chip sm', 'data-irma': k, onclick: () => entrarPlanta(k) }, `▸ ${p.titulo || k}`))),
     pl.img_sem_eq ? h('button', { class: 'chip sm' + (semEq() ? '' : ' on'), id: 'btnEquip', 'aria-pressed': String(!semEq()),
       onclick: () => { semEq(!semEq()); render(); } }, semEq() ? 'Equipamentos: desligados' : 'Equipamentos: ligados') : null) : null;
   if (S.edit) desenhoEdicao(svg, layer);
@@ -726,7 +733,23 @@ function fit() {
   let s = Math.min(w.clientWidth / pl.w, w.clientHeight / pl.h);
   const emPe = w.clientHeight > w.clientWidth * 1.15;
   if (pl.pai && emPe) s = w.clientWidth / pl.w;  // planta-detalhe no celular em pé: pela largura
-  S.zoom = { s, fit: s, x: (w.clientWidth - pl.w * s) / 2, y: Math.max(0, (w.clientHeight - pl.h * s) / 2), _nv: S.planta }; applyZoom();
+  S.zoom = { s, fit: s, x: (w.clientWidth - pl.w * s) / 2, y: Math.max(0, (w.clientHeight - pl.h * s) / 2), _nv: S.planta };
+  // ciclo 20: no celular (em pé ou deitado), o andar abre com zoom no prédio – o retângulo das salas, sem as áreas externas e a margem do desenho
+  // (deitado: o prédio inteiro na tela).
+  // "fit" continua sendo o da planta inteira (rótulos perto/longe); o − afasta até a planta inteira.
+  const bb = (!pl.pai || S.planta !== 'SL') && celular() && c20('zoom') && caixaPredio(S.planta);   // a sala limpa fica como era; a sala de geradores também abre no prédio
+  if (bb) { const [x0, y0, x1, y1] = bb, cw = w.clientWidth, ch = w.clientHeight; let sb = Math.min(cw / (x1 - x0), ch / (y1 - y0));
+    // em pé, um prédio largo ficaria uma faixa fina no meio da tela: ele ganha altura (até 2,2× o enquadramento), centrado – arrasta-se para os lados
+    if (emPe) sb = Math.max(sb, Math.min(Math.max(cw / (x1 - x0), ch / (y1 - y0)), sb * 2.2));
+    if (sb > s * 1.08) S.zoom = { ...S.zoom, s: sb, x: (cw - (x0 + x1) * sb) / 2, y: (ch - (y0 + y1) * sb) / 2 }; }
+  applyZoom();
+}
+const celular = () => Math.min(window.innerWidth, window.innerHeight) < 600;   // celular em pé ou deitado (o iPad e o PC ficam com a planta inteira)
+function caixaPredio(plId) {   // retângulo das salas do andar (sem áreas externas), com 3% de margem
+  const ps = salasDe(plId).filter(x => x.tipo !== 'externa' && x.poly && x.poly.length).flatMap(x => x.poly); if (ps.length < 3) return null;
+  const xs = ps.map(p => p[0]), ys = ps.map(p => p[1]), pl = S.seed.plantas[plId];
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys), m = Math.max(x1 - x0, y1 - y0) * 0.03;
+  return [Math.max(0, x0 - m), Math.max(0, y0 - m), Math.min(pl.w, x1 + m), Math.min(pl.h, y1 + m)];
 }
 function zoomBy(f, cx, cy) {
   const w = $('#mapwrap'); if (!w) return;
@@ -1312,7 +1335,7 @@ function secFotos(s) {
   return h('section', { class: 'fotos-sala', id: 'fotosSala' },
     h('div', { class: 'fs-head' }, h('b', { id: 'nFotosSala' }, `📷 Fotos da sala${of !== s ? ' ' + codSala(of) : ''} (${l.length})`),
       h('button', { type: 'button', class: 'primary', id: 'btnFotografar', onclick: () => abrirCamera(s) }, '📷 Fotografar'),
-      h('label', { class: 'btn mini' }, '🖼 Do aparelho', h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, name: 'foto', id: 'inFotoSala', onchange: aoEscolher })),
+      btnGaleria('inFotoSala', async (f, gx) => { await addFotoSala(f, s, gx); renderPainel(); }),
       h('button', { type: 'button', class: 'mini', id: 'btnRecSala', title: 'Foto que chegou de outra pessoa (não conta como foto tirada na sala)', onclick: () => telaRecebidas({ tipo: 'sala', s }) }, '📥 Recebida'),
       h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true, id: 'inFotoCap', onchange: aoEscolher })),
     l.length ? null : h('p', { class: 'sub' }, 'Sem fotos ainda. "Fotografar" abre a câmera e tira várias fotos seguidas; o comentário pode ficar para depois.'),
@@ -1369,11 +1392,11 @@ async function apagarComConfirmacao(id, depois) {
   return true;
 }
 const btnApagar = (id, depois) => h('button', { type: 'button', class: 'mini apagar', 'data-apagar': id, title: 'Apagar esta foto', onclick: async ev => { ev.stopPropagation(); ev.preventDefault(); await apagarComConfirmacao(id, depois); } }, '🗑 Apagar');
-async function addFotoSala(file, s) {
+async function addFotoSala(file, s, gx) {   // gx (ciclo 20): marca e hora da foto da galeria
   podeRegistrar();
   const o = oficialDe(s);  // foto tirada numa marcação: fica na sala oficial, com a marcação guardada
   return addFoto(file, { id: 'SALA:' + o.id, tag: 'SALA' }, o.codigo && o.codigo !== '?' ? o.codigo : o.id,
-    { sala_id: o.id, planta: o.planta || s.planta || S.planta, origem: 'app', com: '', equip: '', ponto: null, reg: 1, ...(o !== s ? { marcacao: nomeMarca(s), marca_id: s.id } : {}) });
+    { sala_id: o.id, planta: o.planta || s.planta || S.planta, origem: 'app', com: '', equip: '', ponto: null, reg: 1, ...(o !== s ? { marcacao: nomeMarca(s), marca_id: s.id } : {}), ...(gx || {}) });
 }
 // câmera dentro do app: cada toque no disparador grava uma foto e a câmera continua aberta
 async function abrirCamera(s) {
@@ -1531,7 +1554,7 @@ function linhaItem(it, consulta = false) {
     e.c[4] && !e.cr && !e.fora && !e.diverg ? h('div', { class: 'tag-div aviso-cr', 'data-avisocr': it.id }, '⚠ Embarcado sem crated – marque Crated ou "não se aplica"') : null,
     det ? h('div', { class: 'meta det' }, [it.id, it.peso ? `${it.peso} kg` : null, it.dim].filter(Boolean).join(' · ')) : null,  // o CF-ID (chave interna) fica aqui
     h('div', { class: 'meta' }, [e.onde ? `📍 ${rotuloSala(salaPorId(e.onde)) || e.onde}` : (prevista(it) ? '📍 posição prevista (2016)' : it.pos_informada ? `📍 ${it.pos_fonte}` : null),
-      e.enc ? `Encontrado: ${e.enc}` : null, e.estado || null, e.fotos.length ? `📷 ${e.fotos.length}` : null].filter(Boolean).join(' · ') || ' '));
+      encDe(e) ? `Encontrado: ${encDe(e)}` : null, e.estado || null, e.fotos.length ? `📷 ${e.fotos.length}` : null].filter(Boolean).join(' · ') || ' '));
   if (e.fora || e.diverg) { // fora do escopo / divergência: sem etapas, só o desfazer
     row.append(info, h('div', { class: 'etapas' }, h('button', { class: 'mini volta', onclick: async () => {
       if (e.fora) await marcarFora([it], ''); if (e.diverg) await marcarDiverg([it], ''); refrescar(); toast(`${it.tag} · ${it.vol || 'item'} de volta ao escopo`); } },
@@ -1542,7 +1565,8 @@ function linhaItem(it, consulta = false) {
   ETAPAS.forEach((nm, k) => {
     const na = k === 2 && !it.elev;
     bts.append(h('button', { class: 'et' + (e.c[k] ? ' on' : '') + (na ? ' na' : ''), disabled: na || consulta, title: nm, 'data-k': k,
-      onclick: async () => { await toggleEtapa(it, k); troca(); } }, h('i', {}, k + 1), h('span', {}, nm)));
+      onclick: async () => { const antes = !!est(it.id).c[0]; await toggleEtapa(it, k); troca();
+        if (k === 0 && !antes && est(it.id).c[0] && c20('ficha')) ficha(it, true); } }, h('i', {}, k + 1), h('span', {}, nm)));   // ciclo 20: tocou "Conferido" → abre o detalhe
   });
   // crated: do mesmo tamanho dos botões de etapa, mas à parte (não é etapa). Vale depois de "Conferido"; cada toque: não → sim → não se aplica
   const cr = e.cr || '';
@@ -1574,7 +1598,15 @@ function fecharModalJa() {
   m.classList.remove('on'); m.innerHTML = ''; if (f) f(); if (S.seed) refrescar();
 }
 function fecharModal() { if (!desempilhar('modal')) fecharModalJa(); }
-async function ficha(it) {
+// ciclo 20 – "Onde está agora": quem fica fora da lista e a ordem por distância
+const foraDaTroca = x => { const m = (S.seed.salas_fora_da_troca || {})[x.id]; return m == null ? '' : String(m || 'fora da lista'); };
+const naTroca = (x, busca) => { const m = c20('troca') ? foraDaTroca(x) : ''; return !m || (!!busca && !/^fora do escopo/i.test(m)); };
+const centroSala = x => x.label || centroide(x.poly || [[0, 0]]);
+function porDistancia(lista, ref) {
+  const [rx, ry] = centroSala(ref); const d = x => { const [cx, cy] = centroSala(x); return Math.hypot(cx - rx, cy - ry); };
+  return lista.map(x => [d(x), x]).sort((a, b) => a[0] - b[0]).map(p => p[1]);
+}
+async function ficha(it, conferiu) {   // conferiu (ciclo 20): aberta pelo toque em "Conferido"
   const e = est(it.id);
   const sel = (nome, ops, val) => h('select', { name: nome }, h('option', { value: '' }, '—'), ops.map(o => h('option', { value: o, selected: o === val }, o)));
   const fotosBox = h('div', { class: 'thumbs' });
@@ -1590,13 +1622,19 @@ async function ficha(it) {
     const ops = (lista, deSala) => lista.map(x => deSala ? [x.id, rotuloSala(x)] : [x, x]).filter(([v, rot]) => (passa(rot) || v === val) && !usados.has(v) && usados.add(v))
       .map(([v, rot]) => h('option', { value: v, selected: v === val }, rot));
     const grupo = (label, o) => (o.length ? h('optgroup', { label }, o) : null);
-    const validas = pl => salasDe(pl).filter(x => x.tipo !== 'bloco' && (x.codigo !== '?' || x.tipo !== 'sala' || x.nome));
-    const rec = (S.meta.recentes || []).filter(id => !atual || id !== atual.id).map(salaPorId).filter(x => x && x.tipo !== 'bloco');
+    // ciclo 20: salas da lista do escritório (seed.salas_fora_da_troca: escritório, sanitário…) saem da lista; com texto na busca voltam,
+    // menos as marcadas "fora do escopo", que não aparecem nunca. O valor já escolhido sempre fica.
+    const validas = pl => salasDe(pl).filter(x => x.tipo !== 'bloco' && (x.codigo !== '?' || x.tipo !== 'sala' || x.nome) && naTroca(x, t));
+    const rec = (S.meta.recentes || []).filter(id => !atual || id !== atual.id).map(salaPorId).filter(x => x && x.tipo !== 'bloco' && naTroca(x, t));
+    // ciclo 20: primeiro as salas do mesmo andar da sala atual, da mais perto para a mais longe; depois as demais, por andar
+    const plRef = atual && c20('troca') ? (atual.planta || S.planta) : null;
+    const perto = plRef ? porDistancia(validas(plRef).filter(x => x.id !== atual.id), atual) : [];
     selOnde.innerHTML = '';
     selOnde.append(...[h('option', { value: '', selected: !val }, '— na sala de origem —'),
       grupo('Você está aqui', atual ? ops([atual], true) : []), grupo('Salas recentes', ops(rec, true)),
       grupo('Locais do move-out', ops(S.seed.locais, false)),
-      ...Object.keys(S.seed.plantas).map(pl => grupo(S.seed.plantas[pl].nome, ops(validas(pl), true)))].filter(Boolean));
+      plRef ? grupo(`Neste andar (${S.seed.plantas[plRef] ? S.seed.plantas[plRef].titulo || plRef : plRef}) – mais perto primeiro`, ops(perto, true)) : null,
+      ...Object.keys(S.seed.plantas).filter(pl => pl !== plRef).map(pl => grupo(S.seed.plantas[pl].nome, ops(validas(pl), true)))].filter(Boolean));
     if (val && ![...selOnde.options].some(o => o.value === val)) selOnde.append(h('option', { value: val, selected: true }, val));
     selOnde.value = val;
   };
@@ -1608,11 +1646,10 @@ async function ficha(it) {
     // um só campo de comentário: na divergência ele é obrigatório e vale também como o comentário da divergência
     const divOn = !!fd.get('divOn'); const dmot = divOn ? (fd.get('dmotivo') || '') : ''; const dobs = divOn ? (fd.get('com') || '').trim() : '';
     if (divOn && (!dmot || !dobs || !(est(it.id).fotos || []).length)) { alert('Divergência exige motivo, comentário e pelo menos uma foto.'); return; }
-    const patch = { enc: fd.get('enc') || '', estado: fd.get('estado') || '', onde: fd.get('onde') || '', com: fd.get('com') || '' };
+    const patch = { estado: fd.get('estado') || '', onde: fd.get('onde') || '', com: fd.get('com') || '' };
     const ch = Object.keys(patch).filter(k => patch[k] !== (e[k] || ''));
     const nPartes = partesM(it) ? +fd.get('partes_n') || 0 : 0;
     if (partesM(it) && nPartes !== (+e.partes_n || 0)) { patch.partes_n = nPartes; ch.push('partes_n'); }
-    if (patch.enc === 'S' && !est(it.id).c[0] && !foraOn && confirmaPartes(it, nPartes)) patch.c = [1, ...est(it.id).c.slice(1)];
     if (ch.length || patch.c) await setEstado(it.id, patch, ch.join(',') || 'Conferido', ch.map(k => patch[k]).join(' | '));
     if (motivo !== (e.fora || '') || fobs !== (e.fora_obs || '')) await marcarFora([it], motivo, fobs);
     if (dmot !== (e.diverg || '') || dobs !== (e.diverg_obs || '')) await marcarDiverg([it], dmot, dobs);
@@ -1622,12 +1659,15 @@ async function ficha(it) {
     h('p', { class: 'vol-ficha', id: 'fichaVol' }, it.vol || '—', diferenca(it) ? h('span', { class: 'dif' }, diferenca(it)) : null),
     h('p', { class: 'sub', id: 'fichaSub' }, `${it.crate ? 'crate ' + it.crate + ' · ' : ''}origem ${it.sala}${it.peso ? ' · ' + it.peso + ' kg' : ''}${it.dim ? ' · ' + it.dim : ''} · ${it.id}`),
     it.pos_fonte ? (it.pos_informada
-      ? h('p', { class: 'aviso-pos', id: 'avisoPos' }, `📍 ${it.pos_fonte}. Este item ainda não foi conferido: confirme na vistoria (marque "Encontrado") ou informe onde está.`)
+      ? h('p', { class: 'aviso-pos', id: 'avisoPos' }, `📍 ${it.pos_fonte}. Este item ainda não foi conferido: confirme na vistoria (toque em "Conferido") ou informe onde está.`)
       : prevista(it)
       ? h('p', { class: 'aviso-pos', id: 'avisoPos' }, '⚠ Posição prevista (layout 2016): nenhuma marcação de campo confirma onde este item está. Se achar em outro lugar, informe em "Onde está agora"; se não estiver no site, marque abaixo.')
       : h('p', { class: 'sub', id: 'avisoPos' }, `📍 Posição na planta: ${it.pos_fonte}`)) : null,
     h('div', { class: 'grid' },
-      h('div', { class: 'fl' }, 'Encontrado', h('div', { class: 'seg' }, ['S', 'N', 'P'].map(v => h('label', {}, h('input', { type: 'radio', name: 'enc', value: v, checked: e.enc === v }), h('span', {}, { S: 'Sim', N: 'Não', P: 'Parcial' }[v]))))),
+      // ciclo 20: some a pergunta "Encontrado"; "Conferido" é o encontrado. Um "Não"/"Parcial" de versão antiga continua aparecendo como estava.
+      h('div', { class: 'fl full', id: 'fichaConf', 'data-conf': est(it.id).c[0] ? '1' : '0' }, est(it.id).c[0]
+        ? h('b', { class: 'ok-conf' }, `✓ Conferido – encontrado${e.enc && e.enc !== 'S' ? ` (registro antigo: ${{ N: 'Não', P: 'Parcial' }[e.enc] || e.enc})` : ''}`, conferiu ? h('span', { class: 'sub' }, ' · volume, fotos e observação abaixo (opcional)') : null)
+        : h('span', { class: 'sub' }, 'Ainda não conferido – toque em "Conferido" no item para registrar que ele foi encontrado.')),
       h('label', {}, 'Estado', sel('estado', S.seed.estados, e.estado)),
       partesM(it) ? h('label', { id: 'campoPartes' }, 'Partes vistas', h('span', { class: 'partes-l' }, h('select', { name: 'partes_n', id: 'fichaPartes' }, Array.from({ length: partesM(it) + 1 }, (_, n) => h('option', { value: n, selected: n === partesN(it) }, String(n)))), ` de ${partesM(it)}`)) : null,
       h('div', { class: 'fl full', id: 'campoOnde' }, 'Onde está agora',
@@ -1649,8 +1689,9 @@ async function ficha(it) {
         h('label', {}, 'Motivo', h('select', { name: 'dmotivo', id: 'divMotivo' }, h('option', { value: '' }, '—'), ESC().motivos_diverg.map(m => h('option', { value: m, selected: m === e.diverg }, m))))),
       h('p', { class: 'sub' }, 'Exige o comentário (campo "Comentário" acima: onde procurou, quem confirmou) e pelo menos uma foto (abaixo). Conta como divergência no Resumo, no dashboard e na coluna Obs. da planilha.')),
     h('div', { class: 'fotos' }, h('b', {}, 'Fotos'), fotosBox,
-      h('label', { class: 'btn' }, '📷 Tirar / escolher foto', h('input', { type: 'file', accept: 'image/*', capture: 'environment', multiple: true, hidden: true, name: 'foto',
+      h('label', { class: 'btn' }, c20('galeria') ? '📷 Câmera' : '📷 Tirar / escolher foto', h('input', { type: 'file', accept: 'image/*', capture: 'environment', multiple: true, hidden: true, name: 'foto',
         onchange: async ev => { for (const f of ev.target.files) { const fo = await addFoto(f, it); fotosBox.append(thumb(fo, true)); } ev.target.value = ''; } })),
+      c20('galeria') ? btnGaleria('inFotoItemGal', async (f, gx) => { const fo = await addFoto(f, it, null, gx); fotosBox.append(thumb(fo, true)); }) : null,
       h('button', { type: 'button', id: 'btnRecItem', title: 'Foto que chegou de outra pessoa', onclick: () => telaRecebidas({ tipo: 'item', it }) }, '📥 Foto recebida')),
     h('div', { class: 'acts' }, h('button', { type: 'button', onclick: fecharModal }, 'Cancelar'), h('button', { type: 'submit', class: 'primary' }, 'Salvar')));
   modal(form);
@@ -1675,6 +1716,19 @@ export async function comprimir(file, max = 1600, q = 0.75) {
   const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', q));
   return { blob, w, h: hh };
 }
+// ciclo 20 (v1.13.0) – foto escolhida da GALERIA (não tirada pela câmera agora): leva a hora da foto – EXIF DateTimeOriginal; sem EXIF, a data do
+// arquivo, com aviso – e a marca "galeria" no pacote. No PC é foto do app como as outras. A cópia é regravada pelo app (sem GPS), como sempre.
+async function extraGaleria(file) {
+  if (!c20('galeria')) return {};
+  let t = 0; try { t = dataExif(await file.arrayBuffer()); } catch { t = 0; }
+  const lm = +file.lastModified || 0, ts = t || (lm && lm <= Date.now() + 864e5 ? lm : Date.now());
+  // o seletor do aparelho também oferece a câmera: foto tirada agora (hora a menos de 2 min) é foto nova, do app – sem a marca "galeria"
+  if (Math.abs(Date.now() - ts) < 120000) return {};
+  if (!t) toast(`Foto da galeria sem a data original (EXIF): vale a data do arquivo, ${fmtD(ts)}`);
+  return { origem: 'galeria', galeria: 1, ts, ts_anexo: Date.now(), ts_fonte: t ? 'exif' : lm ? 'arquivo' : 'anexo' };
+}
+const btnGaleria = (id, aoEscolher, multiplo = true) => h('label', { class: 'btn mini galeria', title: 'Escolher uma foto já tirada (galeria do aparelho)' }, '🖼 Galeria',
+  h('input', { type: 'file', accept: 'image/*', multiple: multiplo, hidden: true, id, onchange: async ev => { const fs = [...ev.target.files]; ev.target.value = ''; for (const f of fs) await aoEscolher(f, await extraGaleria(f)); } }));
 async function addFoto(file, it, salaOverride, extra) {
   podeRegistrar();
   podeRegistrar();
@@ -2202,7 +2256,7 @@ async function entregarAparelho() {
   const passo1 = async () => {
     const v = nome.value.trim(); if (v && v !== S.meta.aparelho.nome) { S.meta.aparelho = { ...S.meta.aparelho, nome: v }; await DB.put('meta', S.meta.aparelho, 'aparelho'); }
     await log('sistema', null, 'aparelho entregue', S.meta.aparelho.nome, { aparelho_id: S.meta.aparelho.id });
-    await fecharDia(false); etapa = 1; desenha();
+    if (await fecharDia(false) === 'cancelado') return; etapa = 1; desenha();
   };
   const passo2 = async () => {
     S.meta.aparelho = { ...S.meta.aparelho, ativo: false, entregue: Date.now() }; await DB.put('meta', S.meta.aparelho, 'aparelho'); S._regInativo = false;
@@ -2398,6 +2452,7 @@ async function fecharDia(completo, quieto, enviar) {
   if (espelho()) { toast('ESPELHO – só leitura: não gera pacote'); return 'espelho'; }
   if (!S.meta.conferente) await pedirConferente('O pacote do dia leva o nome de quem conferiu.');
   await encerrarVistoria();  // fechar o dia fecha a janela da sala atual
+  if (!completo && !(await antesDeFechar())) { toast('Fechamento cancelado – nada foi gerado'); return 'cancelado'; }   // ciclo 20: saídas e Cheguei/Saí
   if (completo) {
     const { zip, nome } = await montarPacote(true);
     baixar(zip, nome); S.ultPac = { zip, nome, backup: true }; window.__ULTIMO_PACOTE__ = { nome, size: zip.size };
@@ -2417,6 +2472,50 @@ async function fecharDia(completo, quieto, enviar) {
   await DB.put('meta', 0, 'pendentes'); await DB.put('meta', S.meta.ultimoFechamento, 'ultimoFechamento'); await DB.put('meta', null, 'pendDesde');
   window.__ULTIMO_PACOTE__ = { nome, size: zip.size };
   render(); toast(`${nome} gerado (${(zip.size / 1e6).toFixed(1)} MB)${S.meta.conferente ? '' : ' – ATENÇÃO: sem nome do conferente'}`); return 'pacote';
+}
+// ciclo 20 (v1.13.0) – antes de gerar o pacote do dia:
+// 1) quem foi marcado no site (Diário → Pessoas) e não tem saída recebe a hora de saída – ninguém atravessa para o dia seguinte. Padrão: a hora do
+//    último registro daquele dia no aparelho. Entram as presenças de hoje e as de dias ainda não fechados neste aparelho.
+// 2) se faltar o "Cheguei" ou o "Saí" do conferente hoje, pede a hora; em branco = pula, e o escritório segue deduzindo pela 1ª e pela última ação.
+// Devolve false se a pessoa cancelar (nada é gerado).
+async function antesDeFechar() {
+  if (!c20('fechar') || espelho()) return true;
+  const hj = isoDia(), uf = S.meta.ultimoFechamento ? isoLocal(S.meta.ultimoFechamento).slice(0, 10) : '';
+  const abertas = diLista('pres', r => !String(r.sai || '').trim() && r.dia <= hj && (r.dia === hj || (!!uf && r.dia > uf))).sort((a, b) => (a.dia || '').localeCompare(b.dia || '') || (a.nome || '').localeCompare(b.nome || ''));
+  const pts = diHoje('ponto'), faltaChe = !pts.some(p => p.tipo === 'cheguei'), faltaSai = !pts.length || pts[pts.length - 1].tipo !== 'sai';
+  if (!abertas.length && !faltaChe && !faltaSai) return true;
+  const evs = (await DB.all('eventos')).filter(e => e.ts && e.tipo !== 'sistema'), doDia = d => evs.filter(e => isoLocal(e.ts).slice(0, 10) === d).map(e => e.ts);
+  const ultDe = d => { const t = doDia(d); return t.length ? Math.max(...t) : (d === hj ? Date.now() : 0); };
+  const tHoje = doDia(hj), dedChe = tHoje.length ? Math.min(...tHoje) : 0;
+  const inPes = abertas.map(r => h('input', { type: 'time', required: true, value: ultDe(r.dia) ? diHora(ultDe(r.dia)) : '', 'data-saida': r.id }));
+  const inChe = faltaChe ? h('input', { type: 'time', id: 'fechChe', 'data-ponto': 'cheguei' }) : null, inSai = faltaSai ? h('input', { type: 'time', id: 'fechSai', 'data-ponto': 'sai' }) : null;
+  const usar = (inp, t, rot) => h('button', { type: 'button', class: 'mini', 'data-usar': inp.dataset.ponto, onclick: () => { inp.value = diHora(t || Date.now()); } }, `usar ${diHora(t || Date.now())}${rot ? ' (' + rot + ')' : ''}`);
+  return new Promise(res => {
+    let ok = false;
+    const form = h('form', { class: 'ficha', id: 'antesFechar', onsubmit: async ev => {
+      ev.preventDefault();
+      if (inPes.some(i => !i.value)) { toast('Informe a hora de saída de todos'); return; }
+      try {
+        for (let i = 0; i < abertas.length; i++) await setDiario('pres', abertas[i].id, { sai: inPes[i].value, sai_fech: 1 }, 'sai', `${inPes[i].value} (no fechamento)`);
+        for (const [inp, tipo] of [[inChe, 'cheguei'], [inSai, 'sai']]) if (inp && inp.value) {
+          const ts = diTs(inp.value, Date.now()); await setDiario('ponto', diId('ponto'), { tipo, hora: ts, no_fech: 1 }, tipo === 'cheguei' ? 'Cheguei' : 'Saí', `${diHora(ts)} (no fechamento)`); }
+      } catch (x) { if (x && (x.inativo || x.espelho)) { fecharModal(); return; } throw x; }
+      ok = true; fecharModal();
+    } },
+      h('h2', {}, 'Antes de fechar o dia'),
+      abertas.length ? h('section', { class: 'di-sec', id: 'fechSaidas' }, h('h3', {}, `Quem não saiu (${abertas.length})`),
+        h('p', { class: 'sub' }, 'Ninguém passa para o dia seguinte: informe a hora de saída. Já vem a hora do último registro do dia.'),
+        h('div', { class: 'di-lista' }, abertas.map((r, i) => h('div', { class: 'di-l', 'data-semsaida': r.id },
+          h('div', { class: 'di-txt' }, h('b', {}, r.nome + (r.equipe ? ' (equipe)' : '')), h('small', {}, [r.empresa, r.dia !== hj ? `dia ${diBr(r.dia)}` : '', r.ent ? `entrada ${r.ent}` : ''].filter(Boolean).join(' · ') || '—')),
+          h('label', {}, 'saída ', inPes[i]))))) : null,
+      faltaChe || faltaSai ? h('section', { class: 'di-sec', id: 'fechPonto' }, h('h3', {}, `Faltou ${[faltaChe ? '"Cheguei"' : '', faltaSai ? '"Saí"' : ''].filter(Boolean).join(' e ')} de hoje`),
+        h('p', { class: 'sub' }, 'Informe a hora, ou deixe em branco para pular: aí o escritório usa a 1ª e a última ação do dia, como antes.'),
+        inChe ? h('div', { class: 'di-l' }, h('b', {}, 'Cheguei'), inChe, dedChe ? usar(inChe, dedChe, '1ª ação') : null) : null,
+        inSai ? h('div', { class: 'di-l' }, h('b', {}, 'Saí'), inSai, usar(inSai, Date.now(), 'agora')) : null) : null,
+      h('div', { class: 'acts' }, h('button', { type: 'button', id: 'btnAntesCancelar', onclick: () => fecharModal() }, 'Cancelar'),
+        h('button', { type: 'submit', class: 'primary', id: 'btnAntesOk' }, '⬇ Registrar e fechar o dia')));
+    modal(form, () => res(ok));
+  });
 }
 // o que saiu no último fechamento: a lista guardada (v1.6.1 em diante) ou, para um fechamento feito numa versão anterior, os eventos e
 // as fotos já exportados do mesmo dia do último fechamento, até a hora dele
@@ -2523,7 +2622,7 @@ function baixar(zip, nome) { const a = h('a', { href: URL.createObjectURL(zip), 
 async function compartilhar() {
   const novo = !S.ultPac || S.ultPac.backup || (S.meta.pendentes || 0) > 0;
   if (novo) {
-    S.ultPac = null; const r = await fecharDia(false, true);
+    S.ultPac = null; const r = await fecharDia(false, true); if (r === 'cancelado') return 'nada';
     if (r === 'nada' && !(await gerarDeNovo())) return 'nada';   // nada novo: compartilha de novo o pacote do último fechamento
   }
   if (!S.ultPac) return 'nada';
@@ -2700,13 +2799,14 @@ function formFato(tipo, r, pre = '') {
   const tag = h('input', { type: 'text', name: 'tag', id: 'fatoTag', list: 'dlTags', maxlength: 60, placeholder: 'equipamento (opcional)', autocomplete: 'off', value: r ? r.tag || '' : '' });
   const box = h('span', { class: 'prep-th', id: 'fatoFotos' }), cont = h('span', { id: 'fatoNFotos' }, '');
   const minhas = async () => (await DB.all('fotos')).filter(f => f.diario === id && !f.desc);
-  const desenha = async () => { const fs = await minhas(); box.innerHTML = ''; cont.textContent = ` ${fs.length} de 2`; inFoto.disabled = fs.length >= 2; lab.classList.toggle('off', fs.length >= 2);
+  const desenha = async () => { const fs = await minhas(); box.innerHTML = ''; cont.textContent = ` ${fs.length} de 2`; inFoto.disabled = fs.length >= 2; lab.classList.toggle('off', fs.length >= 2); if (labG) labG.classList.toggle('off', fs.length >= 2);
     for (const f of fs) { const im = h('img', { alt: f.id }); urlFoto(f.id).then(u => { if (u) im.src = u; }); box.append(h('figure', { 'data-foto': f.id }, im, btnApagar(f.id, desenha))); } };
   const inFoto = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true, id: 'inFotoFato', onchange: async ev => {
     const fl = [...ev.target.files]; ev.target.value = ''; const ja = (await minhas()).length;
     for (const f1 of fl.slice(0, Math.max(0, 2 - ja))) await addFoto(f1, null, 'DIARIO', { diario: id });
     if (fl.length > 2 - ja) toast('Cada fato leva até 2 fotos'); desenha(); } });
-  const lab = h('label', { class: 'btn', id: 'btnFotoFato' }, '📷 Foto', inFoto);
+  const lab = h('label', { class: 'btn', id: 'btnFotoFato' }, c20('galeria') ? '📷 Câmera' : '📷 Foto', inFoto);
+  const labG = c20('galeria') ? btnGaleria('inFotoFatoGal', async (f1, gx) => { if ((await minhas()).length >= 2) { toast('Cada fato leva até 2 fotos'); return; } await addFoto(f1, null, 'DIARIO', { diario: id, ...gx }); desenha(); }) : null;
   const form = h('form', { class: 'ficha', id: 'formFato', 'data-fato': tipo, onsubmit: async ev => {
     ev.preventDefault();
     const v = { tipo, hora: diTs(hora.value, r ? r.hora : Date.now()), txt: txt.value.trim(), oque: ent ? oque.value.trim() : '', quem: ent ? quem.value.trim() : '', sala: sala.value.trim(), tag: tag.value.trim(), interno: interno.checked ? 1 : 0 };
@@ -2720,7 +2820,7 @@ function formFato(tipo, r, pre = '') {
       h('label', { class: 'chk full', id: 'fatoInternoL' }, interno, ' Interno – não vai ao RDA da MD')),
     h('datalist', { id: 'dlSalas' }, todasSalas().filter(s => s.tipo !== 'bloco' && s.tipo !== 'marca' && s.codigo && s.codigo !== '?').slice(0, 400).map(s => h('option', { value: s.codigo }, s.nome || ''))),
     h('datalist', { id: 'dlTags' }, ((S.seed && S.seed.equips) || []).map(e => h('option', { value: e.tag }, e.nome || ''))),
-    h('div', { class: 'fotos' }, h('b', {}, 'Fotos (até 2)'), cont, box, lab),
+    h('div', { class: 'fotos' }, h('b', {}, 'Fotos (até 2)'), cont, box, lab, labG),
     h('div', { class: 'acts' }, h('button', { type: 'button', id: 'btnFatoCancelar', onclick: async () => {
       if (novo) for (const f of await minhas()) await apagarFoto(f.id);   // fato novo cancelado: as fotos tiradas para ele não ficam soltas
       salvo = true; modal(telaDiario()); } }, 'Cancelar'), h('button', { type: 'submit', class: 'primary', id: 'btnFatoSalvar' }, 'Salvar')));
@@ -2871,7 +2971,7 @@ function pedirConferente(motivo) {
 }
 // atalho para os testes: abre a edição de forma de uma sala (o mesmo que ficha da sala → "Editar forma")
 function editarForma(id) { const s = salasDe(S.planta).find(x => x.id === id); if (!s) return false; S.edit = true; S.draw = null; S.edModo = 'vertices'; S.edTmp = { sala: s, poly: s.poly.map(p => [...p]) }; render(); return true; }
-window.__APP__ = { partesFaltam, prepComs, conferirTodos, setDiario, diLista, abrirDiario, alternarDestaque, snTxt, setSN, snVerif, snNorm, telaSN, SN_TXT, toggleEtapa, marcarFora, apagarFoto, apagarComConfirmacao, loteFora, volumesKanban, kbModelo, kbPos, horasEtapas, S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed, receberEscritorio, entrarEspelho, espelho,
+window.__APP__ = { c20, encDe, porDistancia, centroSala, foraDaTroca, antesDeFechar, extraGaleria, caixaPredio, celular, fit, entrarPlanta, idAtual, formFato, partesFaltam, prepComs, conferirTodos, setDiario, diLista, abrirDiario, alternarDestaque, snTxt, setSN, snVerif, snNorm, telaSN, SN_TXT, toggleEtapa, marcarFora, apagarFoto, apagarComConfirmacao, loteFora, volumesKanban, kbModelo, kbPos, horasEtapas, S, NAV, est, proxima, montarPacote, DB, salasDe, distSeg, pxPorMetro, editarForma, abrirSala, salaPorId, abrirEquip, ondeEsta, encerrarVistoria, tique, nomeArq, nomeFoto, importarSeed, receberEscritorio, entrarEspelho, espelho,
   oficialDe, mostrarQR, entrouSala, diferenca, etAtual, crPend, setCrated, crateTodos, entregarAparelho, restaurar, inativo, prepItens, ficha, fecharDia, enviarPacote, anexarRecebidas, telaRecebidas, dataExif, estadoBateria, prepFotos, unificarPrep, gerarDeNovo, telaAbertura, telaCalibrar, fotosDaSala, addFotoSala, editarFoto, compartilhar, lembretes, isoLocal, qrSvg };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => { });
 iniciar();

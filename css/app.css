@@ -433,3 +433,8 @@ label.chk.inteiro{display:block;background:#fff8d6;border:1px solid #e8d98a;bord
 #faixaEspelho[hidden]{display:none}#faixaEspelho button{min-height:32px;padding:3px 10px;font-size:13px}
 body.espelho #btnFechar,body.espelho #btnCompartilhar,body.espelho #btnVolta,body.espelho #btnRecebidas,body.espelho #btnBackup,body.espelho #btnZerar,body.espelho #btnEditar,body.espelho #btnNovoItem,body.espelho #btnAbertura,body.espelho #pillPend,
 body.espelho label:has(#inRestaurar),body.espelho label:has(#inImportar){display:none!important}
+/* ciclo 20 (v1.13.0): ficha aberta pelo "Conferido"; botão Galeria; perguntas do "Fechar o dia" */
+.ok-conf{color:#2e7d32}
+#fichaConf{margin:2px 0 4px}
+.btn.galeria{white-space:nowrap}
+#antesFechar .di-l input[type=time]{min-width:110px}
